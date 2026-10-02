@@ -95,7 +95,7 @@ class MXCRPlugin(Plugin):
 
     def on_enable(self) -> None:
         """插件启用时调用"""
-        self.logger.info("MXCR 建筑复制工具 v1.0.0 正在启用...")
+        self.logger.info("MXCR 建筑复制工具 v1.0.1 正在启用...")
 
         # data_folder 已经是 pathlib.Path 类型
         data_dir = self.data_folder
@@ -127,7 +127,7 @@ class MXCRPlugin(Plugin):
         # 启动容器管理器+实体管理器超时清理定时任务（每 tick 执行）
         self.server.scheduler.run_task(self, self._container_tick, delay=0, period=1)
 
-        self.logger.info("MXCR 建筑复制工具 v1.0.0 已启用!")
+        self.logger.info("MXCR 建筑复制工具 v1.0.1 已启用!")
 
     def on_disable(self) -> None:
         """插件禁用时调用"""

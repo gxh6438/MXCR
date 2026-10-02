@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "endstone-mxcr"
-version = "1.0.0"
+version = "1.0.1"
 description = "MXCR - Minecraft X Copy Region, 建筑复制/粘贴插件 for Endstone (含 SAPI 桥接 Add-on)"
 requires-python = ">=3.10"
 

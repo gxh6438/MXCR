@@ -1,6 +1,6 @@
 /*
  * MXCR Bridge - SAPI 端脚本
- * 版本: 1.0.0
+ * 版本: 1.0.1
  *
  * 功能:
  *   通过 /scriptevent 与 Endstone 插件双向通信，
@@ -184,19 +184,24 @@ function receiveChunk(envelope) {
 
 /**
  * 根据维度名称获取 Dimension 对象
- * @param {string} dimName - 如 "minecraft:overworld"
+ * 大小写不敏感，兼容 Endstone 传来的所有形式：
+ *   "Overworld" / "overworld" / "minecraft:overworld"
+ *   "Nether" / "nether" / "minecraft:nether"
+ *   "The End" / "the_end" / "minecraft:the_end"
+ * @param {string} dimName
  * @returns {import("@minecraft/server").Dimension | undefined}
  */
 function getDimension(dimName) {
+    if (typeof dimName !== "string" || !dimName) return undefined;
+    let key = dimName.trim().toLowerCase().replace(/\s+/g, "_");
+    if (key.startsWith("minecraft:")) key = key.slice("minecraft:".length);
     const mapping = {
-        "overworld":          "minecraft:overworld",
-        "nether":             "minecraft:nether",
-        "the_end":            "minecraft:the_end",
-        "minecraft:overworld":"minecraft:overworld",
-        "minecraft:nether":   "minecraft:nether",
-        "minecraft:the_end":  "minecraft:the_end",
+        "overworld": "minecraft:overworld",
+        "nether":    "minecraft:nether",
+        "the_end":   "minecraft:the_end",
+        "end":       "minecraft:the_end",
     };
-    const normalized = mapping[dimName] ?? dimName;
+    const normalized = mapping[key] ?? ("minecraft:" + key);
     try {
         return world.getDimension(normalized);
     } catch (e) {
@@ -948,5 +953,5 @@ system.afterEvents.scriptEventReceive.subscribe((event) => {
 
 // world.sendMessage 不能在顶层直接调用，需延迟到第一个 tick
 system.run(() => {
-    world.sendMessage("§a[MXCR Bridge] 容器+实体桥接脚本已加载 v1.0.0");
+    world.sendMessage("§a[MXCR Bridge] 容器+实体桥接脚本已加载 v1.0.1");
 });
