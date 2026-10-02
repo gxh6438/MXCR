@@ -1,0 +1,54 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel (.whl)
+        run: |
+          pip install build
+          python -m build --wheel
+          echo "WHL_FILE=$(ls dist/*.whl)" >> "$GITHUB_ENV"
+
+      - name: Build Add-on (.mcpack)
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PACK="MXCR-Bridge-${TAG}.mcpack"
+          cd addon
+          zip -r "../${PACK}" manifest.json scripts
+          cd ..
+          echo "PACK_FILE=${PACK}" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mxcr-release
+          path: |
+            dist/*.whl
+            *.mcpack
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "MXCR ${{ github.ref_name }}"
+          generate_release_notes: true
+          files: |
+            dist/*.whl
+            *.mcpack
