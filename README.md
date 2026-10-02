@@ -40,24 +40,9 @@
 
 ### 2. 安装 SAPI 桥接包（.mcpack）
 
-从 [Releases](https://github.com/gxh6438/MXCR/releases) 下载最新的 `MXCR-Bridge-x.x.x.mcpack`，安装到服务器的 `behavior_packs/` 目录。
+从 [Releases](https://github.com/gxh6438/MXCR/releases) 下载最新的 `MXCR-Bridge-x.x.x.mcpack` 并安装。
 
-### 3. 配置世界加载行为包（关键步骤）
-
-编辑 `worlds/<世界名>/world_behavior_packs.json`（不存在则新建），`pack_id` 和 `version` 必须与行为包 `manifest.json` 完全一致：
-
-```json
-[
-  {
-    "pack_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "version": [1, 0, 1]
-  }
-]
-```
-
-> ⚠️ **版本号必须一致**：如果升级了行为包但此处 `version` 未同步，行为包将不会加载，后台会持续警告桥接通信失败。
-
-### 4. 验证安装
+### 3. 验证安装
 
 重启服务器后，在世界聊天中应看到：
 
@@ -194,7 +179,7 @@ plugins/mxcr/
 ## 常见问题
 
 **Q: 后台警告"[MXCR] 容器读取失败 / 桥接通信失败"？**
-按顺序排查：① `world_behavior_packs.json` 是否存在于世界目录，`version` 是否与 mcpack 一致；② 服务器启动日志是否有 `[MXCR Bridge] 已加载`；③ 游戏内执行 `/mxcr bridge` 看探测结果。
+按顺序排查：① 行为包是否已安装并在世界中启用；② 服务器启动日志是否有 `[MXCR Bridge] 已加载`；③ 游戏内执行 `/mxcr bridge` 看探测结果。
 
 **Q: 保存时容器物品没存上？**
 SAPI 桥接未工作（见上条）。没有桥接时方块仍可正常复制粘贴，仅容器物品与实体缺失。
@@ -219,8 +204,6 @@ python -m build --wheel
 cd addon
 zip -r ../MXCR-Bridge-x.x.x.mcpack manifest.json scripts
 ```
-
-或直接推送 `v*` 标签，GitHub Actions 将自动构建两种产物并发布 Release。
 
 ## 许可
 
