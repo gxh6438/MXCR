@@ -29,47 +29,18 @@
 
 ### 1. 安装 Endstone 插件（.whl）
 
-从 [Releases](https://github.com/gxh6438/MXCR/releases) 下载最新的 `endstone_mxcr-x.x.x-py3-none-any.whl`，放入服务器 `plugins/` 目录：
-
-```
-bedrock_server/
-└── plugins/
-    └── endstone_mxcr-1.0.1-py3-none-any.whl
-```
-
-或使用 Endstone 自带的 pip 安装：
-
-```bash
-endstone pip install endstone_mxcr-1.0.1-py3-none-any.whl
-```
+从 [Releases](https://github.com/gxh6438/MXCR/releases) 下载最新的 `endstone_mxcr-x.x.x-py3-none-any.whl`，放入服务器 `plugins/` 目录。
 
 重启服务器，看到以下日志说明插件已启用：
 
 ```
-[INFO] [Mxcr] MXCR 建筑复制工具 v1.0.1 正在启用...
-[INFO] [Mxcr] MXCR 建筑复制工具 v1.0.1 已启用!
+[INFO] [Mxcr] MXCR 建筑复制工具 v x.x.x 正在启用...
+[INFO] [Mxcr] MXCR 建筑复制工具 v x.x.x 已启用!
 ```
 
 ### 2. 安装 SAPI 桥接包（.mcpack）
 
-下载 `MXCR-Bridge-x.x.x.mcpack`，将其放入 `behavior_packs/` 目录（mcpack 本质是 zip，直接放即可，无需解压）：
-
-```
-bedrock_server/
-└── behavior_packs/
-    └── MXCR-Bridge-1.0.1.mcpack
-```
-
-或解压为文件夹形式：
-
-```
-bedrock_server/
-└── behavior_packs/
-    └── mxcr_bridge/
-        ├── manifest.json
-        └── scripts/
-            └── main.js
-```
+从 [Releases](https://github.com/gxh6438/MXCR/releases) 下载最新的 `MXCR-Bridge-x.x.x.mcpack`，安装到服务器的 `behavior_packs/` 目录。
 
 ### 3. 配置世界加载行为包（关键步骤）
 
@@ -91,7 +62,7 @@ bedrock_server/
 重启服务器后，在世界聊天中应看到：
 
 ```
-[MXCR Bridge] 容器+实体桥接脚本已加载 v1.0.1
+[MXCR Bridge] 容器+实体桥接脚本已加载 v x.x.x
 ```
 
 玩家在游戏内执行 `/mxcr bridge` 可主动探测桥接状态。
@@ -246,11 +217,11 @@ python -m build --wheel
 
 # 构建 .mcpack
 cd addon
-zip -r ../MXCR-Bridge-1.0.1.mcpack manifest.json scripts
+zip -r ../MXCR-Bridge-x.x.x.mcpack manifest.json scripts
 ```
 
 或直接推送 `v*` 标签，GitHub Actions 将自动构建两种产物并发布 Release。
 
 ## 许可
 
-基于原作者 MXCR Developer 的插件修复重构而来，仅供学习交流使用。
+MIT License
