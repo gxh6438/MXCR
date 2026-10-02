@@ -2,10 +2,6 @@
 
 基岩版建筑复制/粘贴插件，由 **Endstone Python 插件** 与 **SAPI 桥接 Add-on** 两部分组成，支持方块、方块状态、容器物品、实体的完整保存与恢复。
 
-![Version](https://img.shields.io/badge/version-1.0.1-blue)
-![Platform](https://img.shields.io/badge/platform-Bedrock%20Dedicated%20Server-orange)
-![Runtime](https://img.shields.io/badge/runtime-Endstone%200.11%2B-green)
-
 ## 功能特性
 
 - **选区系统**：木斧两点选区 + 木棍微调，粒子边框实时预览
