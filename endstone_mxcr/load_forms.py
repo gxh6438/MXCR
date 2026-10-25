@@ -1,7 +1,8 @@
 """
 加载建筑配置表单模块
-包含预览功能的加载配置界面
+包含预览功能的加载配置界面 (v1.1.0: 引擎原生放置，移除可靠模式/来源目录)
 """
+import math
 import json
 from endstone.form import ModalForm, ActionForm, TextInput, Toggle, Dropdown, Label
 
@@ -27,18 +28,18 @@ def _b(text: str, color: str = "") -> str:
 
 
 def show_load_config_form(form_manager, player, structure_id: str, meta,
-                          source_type: str = "player", source_dir: str = ""):
+                          source_type: str = "player"):
     """显示加载建筑配置表单"""
-    loc = player.location
-    
+    size = meta.get_size()
+
     form = ModalForm(
         title=_b("加载建筑配置", C_GREEN),
         controls=[
             Label(
                 f"{C_YELLOW}建筑: {C_WHITE}{meta.name}\n"
-                f"{C_YELLOW}尺寸: {C_WHITE}{meta.max_x - meta.min_x + 1} x "
-                f"{meta.max_y - meta.min_y + 1} x {meta.max_z - meta.min_z + 1}\n"
-                f"{C_YELLOW}方块数: {C_WHITE}{meta.block_count}"
+                f"{C_YELLOW}尺寸: {C_WHITE}{size[0]} x {size[1]} x {size[2]}\n"
+                f"{C_YELLOW}区域体积: {C_WHITE}{meta.get_volume()} 方块"
+                + (f"\n{C_LIGHT_PURPLE}(大区域结构束，将分片放置)" if meta.is_bundle else "")
             ),
             Dropdown(
                 f"{_b('粘贴模式', C_AQUA)}",
@@ -68,13 +69,9 @@ def show_load_config_form(form_manager, player, structure_id: str, meta,
                 f"{_b('启用预览', C_LIGHT_PURPLE)}",
                 default_value=True
             ),
-            Toggle(
-                f"{_b('传统可靠模式', C_RED)} {C_WHITE}(全部区块逐个 TP，防漏区块，速度较慢)",
-                default_value=False
-            ),
         ],
         on_submit=lambda p, data: _on_load_config_submit(
-            form_manager, p, data, structure_id, meta, source_type, source_dir
+            form_manager, p, data, structure_id, meta, source_type
         ),
         on_close=lambda p: p.send_message(f"{C_YELLOW}已取消加载")
     )
@@ -82,7 +79,7 @@ def show_load_config_form(form_manager, player, structure_id: str, meta,
 
 
 def _on_load_config_submit(form_manager, player, data_str: str, structure_id: str,
-                           meta, source_type: str, source_dir: str):
+                           meta, source_type: str):
     """加载配置提交回调"""
     try:
         data = json.loads(data_str)
@@ -92,14 +89,12 @@ def _on_load_config_submit(form_manager, player, data_str: str, structure_id: st
         # data[3] = Y 偏移量 (TextInput, str)
         # data[4] = Z 偏移量 (TextInput, str)
         # data[5] = 启用预览 (Toggle, bool)
-        # data[6] = 传统可靠模式 (Toggle, bool)
-        
+
         mode = int(data[1]) if data[1] is not None else 0
         offset_x = int(data[2]) if data[2] and data[2].strip() else 0
         offset_y = int(data[3]) if data[3] and data[3].strip() else 0
         offset_z = int(data[4]) if data[4] and data[4].strip() else 0
         enable_preview = bool(data[5]) if data[5] is not None else False
-        reliable_mode = bool(data[6]) if len(data) > 6 and data[6] is not None else False
 
         # 注意：粘贴位置模式（脚下/面前/自定义）不对应 allow_foot_block/allow_move_mode
         # 这两个权限键分别控制"脚下放置方块工具"和"保存时的搬迁模式"，已在各自入口校验
@@ -109,36 +104,30 @@ def _on_load_config_submit(form_manager, player, data_str: str, structure_id: st
         loc = player.location
 
         if mode == 0:  # 玩家脚下
-            target_x = int(loc.x) + offset_x
-            target_y = int(loc.y) + offset_y
-            target_z = int(loc.z) + offset_z
+            target_x = math.floor(loc.x) + offset_x
+            target_y = math.floor(loc.y) + offset_y
+            target_z = math.floor(loc.z) + offset_z
         elif mode == 1:  # 玩家面前 3 格
             # 根据玩家朝向计算前方位置
             yaw = loc.yaw
-            import math
             # yaw: 0=南, 90=西, 180=北, 270=东
             forward_x = -math.sin(math.radians(yaw)) * 3
             forward_z = math.cos(math.radians(yaw)) * 3
-            target_x = int(loc.x + forward_x) + offset_x
-            target_y = int(loc.y) + offset_y
-            target_z = int(loc.z + forward_z) + offset_z
+            target_x = math.floor(loc.x + forward_x) + offset_x
+            target_y = math.floor(loc.y) + offset_y
+            target_z = math.floor(loc.z + forward_z) + offset_z
         else:  # 自定义坐标
-            # 显示自定义坐标输入表单（v1.0.0 修复：传递 reliable_mode，此前在此路径丢失）
             show_custom_coord_form(
                 form_manager, player, structure_id, meta,
                 offset_x, offset_y, offset_z, enable_preview,
-                source_type, source_dir, reliable_mode
+                source_type
             )
             return
 
         target_pos = (target_x, target_y, target_z)
 
-        # v1.0.0: 高度检测改为维度感知（下界 0~127 / 末地 0~255 / 主世界 -64~319）
-        size = (
-            meta.max_x - meta.min_x + 1,
-            meta.max_y - meta.min_y + 1,
-            meta.max_z - meta.min_z + 1
-        )
+        # 高度检测（维度感知：下界 0~127 / 末地 0~255 / 主世界 -64~319）
+        size = meta.get_size()
         min_y = target_y
         max_y = target_y + size[1] - 1
 
@@ -152,26 +141,23 @@ def _on_load_config_submit(form_manager, player, data_str: str, structure_id: st
             # 超出高度限制，显示警告
             show_height_warning(
                 form_manager, player, structure_id, meta,
-                target_pos, enable_preview, source_type, source_dir,
-                min_y, max_y, reliable_mode
+                target_pos, enable_preview, source_type,
+                min_y, max_y
             )
             return
 
         if enable_preview:
-            # 启动预览（v1.0.0 修复：传递 reliable_mode）
+            # 启动预览
             plugin.preview_manager.start_preview(
-                player, structure_id, meta, target_pos,
-                source_type, source_dir, reliable_mode
+                player, structure_id, meta, target_pos, source_type
             )
         else:
             # 直接加载
             plugin.load_structure_for_player(
-                player, structure_id, target_pos,
-                source_type=source_type, source_dir=source_dir,
-                reliable_mode=reliable_mode
+                player, structure_id, target_pos, source_type=source_type
             )
 
-    except ValueError as e:
+    except ValueError:
         player.send_message(f"{C_RED}输入错误: 偏移量必须是整数")
     except Exception as e:
         player.send_message(f"{C_RED}加载失败: {str(e)}")
@@ -179,8 +165,7 @@ def _on_load_config_submit(form_manager, player, data_str: str, structure_id: st
 
 def show_custom_coord_form(form_manager, player, structure_id: str, meta,
                            offset_x: int, offset_y: int, offset_z: int,
-                           enable_preview: bool, source_type: str, source_dir: str,
-                           reliable_mode: bool = False):
+                           enable_preview: bool, source_type: str):
     """显示自定义坐标输入表单"""
     form = ModalForm(
         title=_b("自定义坐标", C_AQUA),
@@ -204,7 +189,7 @@ def show_custom_coord_form(form_manager, player, structure_id: str, meta,
         ],
         on_submit=lambda p, data: _on_custom_coord_submit(
             form_manager, p, data, structure_id, meta,
-            enable_preview, source_type, source_dir, reliable_mode
+            enable_preview, source_type
         ),
         on_close=lambda p: p.send_message(f"{C_YELLOW}已取消加载")
     )
@@ -212,8 +197,7 @@ def show_custom_coord_form(form_manager, player, structure_id: str, meta,
 
 
 def _on_custom_coord_submit(form_manager, player, data_str: str, structure_id: str,
-                            meta, enable_preview: bool, source_type: str, source_dir: str,
-                            reliable_mode: bool = False):
+                            meta, enable_preview: bool, source_type: str):
     """自定义坐标提交回调"""
     try:
         data = json.loads(data_str)
@@ -221,19 +205,15 @@ def _on_custom_coord_submit(form_manager, player, data_str: str, structure_id: s
         # data[1] = X 坐标
         # data[2] = Y 坐标
         # data[3] = Z 坐标
-        
+
         x = int(data[1]) if data[1] else meta.min_x
         y = int(data[2]) if data[2] else meta.min_y
         z = int(data[3]) if data[3] else meta.min_z
 
         target_pos = (x, y, z)
 
-        # v1.0.0: 高度检测改为维度感知
-        size = (
-            meta.max_x - meta.min_x + 1,
-            meta.max_y - meta.min_y + 1,
-            meta.max_z - meta.min_z + 1
-        )
+        # 高度检测（维度感知）
+        size = meta.get_size()
         min_y = y
         max_y = y + size[1] - 1
 
@@ -247,40 +227,36 @@ def _on_custom_coord_submit(form_manager, player, data_str: str, structure_id: s
             # 超出高度限制，显示警告
             show_height_warning(
                 form_manager, player, structure_id, meta,
-                target_pos, enable_preview, source_type, source_dir,
-                min_y, max_y, reliable_mode
+                target_pos, enable_preview, source_type,
+                min_y, max_y
             )
             return
 
         if enable_preview:
-            # 启动预览（v1.0.0 修复：传递 reliable_mode）
+            # 启动预览
             form_manager.plugin.preview_manager.start_preview(
-                player, structure_id, meta, target_pos,
-                source_type, source_dir, reliable_mode
+                player, structure_id, meta, target_pos, source_type
             )
         else:
             # 直接加载
             form_manager.plugin.load_structure_for_player(
-                player, structure_id, target_pos,
-                source_type=source_type, source_dir=source_dir,
-                reliable_mode=reliable_mode
+                player, structure_id, target_pos, source_type=source_type
             )
-            
+
     except ValueError:
         player.send_message(f"{C_RED}坐标格式错误: 必须是整数")
     except Exception as e:
         player.send_message(f"{C_RED}加载失败: {str(e)}")
 
 
-
 def show_height_warning(form_manager, player, structure_id: str, meta,
                         target_pos: tuple, enable_preview: bool,
-                        source_type: str, source_dir: str,
-                        min_y: int, max_y: int, reliable_mode: bool = False):
+                        source_type: str,
+                        min_y: int, max_y: int):
     """显示高度警告窗口"""
     from endstone.form import MessageForm
 
-    # v1.0.0: 按当前维度显示真实高度限制
+    # 按当前维度显示真实高度限制
     try:
         dim_key = player.location.dimension.name.lower()
     except Exception:
@@ -302,7 +278,7 @@ def show_height_warning(form_manager, player, structure_id: str, meta,
         button2=_b("我已确认服务器高度状况，仍要加载", C_RED),
         on_submit=lambda p, idx: _on_height_warning_submit(
             form_manager, p, idx, structure_id, meta,
-            target_pos, enable_preview, source_type, source_dir, reliable_mode
+            target_pos, enable_preview, source_type
         )
     )
     player.send_form(form)
@@ -310,8 +286,7 @@ def show_height_warning(form_manager, player, structure_id: str, meta,
 
 def _on_height_warning_submit(form_manager, player, button_idx: int,
                                structure_id: str, meta, target_pos: tuple,
-                               enable_preview: bool, source_type: str, source_dir: str,
-                               reliable_mode: bool = False):
+                               enable_preview: bool, source_type: str):
     """高度警告提交回调"""
     if button_idx == 0:
         # 取消
@@ -319,15 +294,12 @@ def _on_height_warning_submit(form_manager, player, button_idx: int,
     else:
         # 确认加载
         if enable_preview:
-            # 启动预览（v1.0.0 修复：传递 reliable_mode）
+            # 启动预览
             form_manager.plugin.preview_manager.start_preview(
-                player, structure_id, meta, target_pos,
-                source_type, source_dir, reliable_mode
+                player, structure_id, meta, target_pos, source_type
             )
         else:
             # 直接加载
             form_manager.plugin.load_structure_for_player(
-                player, structure_id, target_pos,
-                source_type=source_type, source_dir=source_dir,
-                reliable_mode=reliable_mode
+                player, structure_id, target_pos, source_type=source_type
             )

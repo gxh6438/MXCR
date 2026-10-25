@@ -1,16 +1,6 @@
 """
-MXCR 主插件类 v1.0.0
-严格基于 Endstone v0.11.0 官方文档开发
-
-已确认的导入路径:
-- from endstone.plugin import Plugin
-- from endstone.command import Command, CommandSender
-- from endstone.event import event_handler, PlayerInteractEvent, PlayerQuitEvent, ScriptMessageEvent
-- from endstone.form import ActionForm, ModalForm, TextInput, Toggle, Dropdown, Label, MessageForm
-- from endstone.level import Location, Dimension
-- from endstone.block import Block, BlockData, BlockState
-
-Player 定义在 endstone/__init__.pyi 中,通过 hasattr 判断
+MXCR 主插件类 v1.1.0
+底层对接 StructBridge：保存/加载/撤销全部走引擎原生 .mcstructure 序列化。
 
 关键 API:
 - Player.is_op -> bool (可读写)
@@ -22,39 +12,35 @@ Player 定义在 endstone/__init__.pyi 中,通过 hasattr 判断
 - Player.spawn_particle(name: str, x: float, y: float, z: float) -> None
 - Player.send_form(form) -> None
 - Player.send_message(message: str) -> None
-- Player.send_popup(message: str) -> None
-- Player.perform_command(command: str) -> bool
 - Server.online_players -> list[Player]
 - Server.get_player(name: str) -> Player
 - Server.scheduler -> Scheduler
 - Server.dispatch_command(sender, command_line)
+- Server.command_sender -> CommandSender (控制台)
+- Dimension.loaded_chunks -> list[Chunk]
 - Scheduler.run_task(plugin, task, delay=0, period=0) -> Task
-- Task.cancel() -> None
-- Task.is_cancelled -> bool
 """
-import json
-import uuid
+import time
 from endstone.plugin import Plugin
 from endstone.command import Command, CommandSender
-from endstone.event import event_handler, PlayerInteractEvent, PlayerQuitEvent, ScriptMessageEvent
+from endstone.event import event_handler, PlayerInteractEvent, PlayerQuitEvent
 
 from .selection_manager import SelectionManager
-from .database_manager import DatabaseManager
 from .config_manager import ConfigManager, PermissionManager
-from .structure_operator import StructureOperator
-from .form_manager import FormManager
-from .undo_manager import UndoManager, BlockRecord, UndoAction
-from .structure_data import BlockInfo, EntityInfo
-from .progress_manager import ProgressManager
-from .chunk_loader import ChunkLoader
 from .normal_permission_manager import NormalPermissionManager
+from .progress_manager import ProgressManager
 from .preview_manager import PreviewManager
-from .container_manager import ContainerManager
-from .entity_manager import EntityManager
+from .form_manager import FormManager
+from .metadata_store import MetadataStore
+from .structbridge_backend import (
+    StructBridgeBackend, STAGE_OK,
+    new_building_key, new_snapshot_key, is_bundle_region,
+)
+from .structure_data import StructureMetadata, UndoEntry
 
 
 class MXCRPlugin(Plugin):
-    """MXCR 建筑复制工具插件 v1.0.0"""
+    """MXCR 建筑复制工具插件 v1.1.0（StructBridge 引擎原生后端）"""
 
     # 插件 API 版本
     api_version = "0.11"
@@ -93,51 +79,48 @@ class MXCRPlugin(Plugin):
         }
     }
 
+    # 搬迁模式 /fill 单次上限（原版 fill 限制 32768，留余量）
+    FILL_LIMIT = 30000
+
     def on_enable(self) -> None:
         """插件启用时调用"""
-        self.logger.info("MXCR 建筑复制工具 v1.0.1 正在启用...")
+        self.logger.info("MXCR 建筑复制工具 v1.1.0 正在启用...")
 
-        # data_folder 已经是 pathlib.Path 类型
         data_dir = self.data_folder
         data_dir.mkdir(parents=True, exist_ok=True)
 
         # 初始化各管理器
         self._selection_mgr = SelectionManager()
-        self._db_mgr = DatabaseManager(data_dir / "data")
         self._config_mgr = ConfigManager(data_dir)
         self._perm_mgr = PermissionManager(data_dir)
         self._normal_perm_mgr = NormalPermissionManager(data_dir, data_dir / "permissions.json")
-        self._preview_mgr = PreviewManager(self)
-        self._struct_op = StructureOperator(self._db_mgr, self._config_mgr, self.server)
-        self._undo_mgr = UndoManager(max_history=10, data_dir=data_dir)
         self._progress_mgr = ProgressManager(self.server)
-        self._chunk_loader = ChunkLoader(self)
+        self._store = MetadataStore(data_dir / "data")
+        self._backend = StructBridgeBackend()
+        self._preview_mgr = PreviewManager(self)
         self._form_mgr = FormManager(self)
-        self._container_mgr = ContainerManager(self)
-        # 将 ContainerManager 注入到 StructureOperator
-        self._struct_op.container_manager = self._container_mgr
 
-        # 初始化实体管理器，并注入到 StructureOperator
-        self._entity_mgr = EntityManager(self)
-        self._struct_op.entity_manager = self._entity_mgr
+        # 结构文件 GC 回调（仅清理 mxcrsnap_* 快照文件）
+        self._store.set_gc_callback(self._gc_snapshot_file)
+
+        # 检测 StructBridge 后端
+        ok, msg = self._backend.ensure()
+        if ok:
+            self.logger.info(f"StructBridge 后端已就绪 (v{self._backend.version})")
+        else:
+            self.logger.error(f"StructBridge 后端不可用: {msg}！")
+            self.logger.error("保存/加载/撤销功能将无法使用。请安装 StructBridge 插件: "
+                              "https://github.com/gxh6438/structbridge")
 
         # 注册事件监听器
         self.register_events(self)
 
-        # 启动容器管理器+实体管理器超时清理定时任务（每 tick 执行）
-        self.server.scheduler.run_task(self, self._container_tick, delay=0, period=1)
-
-        self.logger.info("MXCR 建筑复制工具 v1.0.1 已启用!")
+        self.logger.info("MXCR 建筑复制工具 v1.1.0 已启用!")
 
     def on_disable(self) -> None:
         """插件禁用时调用"""
         try:
             self.server.scheduler.cancel_tasks(self)
-        except Exception:
-            pass
-        # v1.0.0: 清理磁盘化撤销缓存
-        try:
-            self._undo_mgr.shutdown()
         except Exception:
             pass
         self.logger.info("MXCR 建筑复制工具已禁用!")
@@ -149,10 +132,6 @@ class MXCRPlugin(Plugin):
         return self._selection_mgr
 
     @property
-    def db_manager(self) -> DatabaseManager:
-        return self._db_mgr
-
-    @property
     def config_manager(self) -> ConfigManager:
         return self._config_mgr
 
@@ -161,16 +140,8 @@ class MXCRPlugin(Plugin):
         return self._perm_mgr
 
     @property
-    def structure_operator(self) -> StructureOperator:
-        return self._struct_op
-
-    @property
     def form_manager(self) -> FormManager:
         return self._form_mgr
-
-    @property
-    def undo_manager(self) -> UndoManager:
-        return self._undo_mgr
 
     @property
     def progress_manager(self) -> ProgressManager:
@@ -185,16 +156,12 @@ class MXCRPlugin(Plugin):
         return self._preview_mgr
 
     @property
-    def container_manager(self) -> ContainerManager:
-        return self._container_mgr
+    def store(self) -> MetadataStore:
+        return self._store
 
     @property
-    def entity_manager(self) -> EntityManager:
-        return self._entity_mgr
-
-    @property
-    def chunk_loader(self) -> ChunkLoader:
-        return self._chunk_loader
+    def backend(self) -> StructBridgeBackend:
+        return self._backend
 
     # ========== 权限检查 ==========
 
@@ -204,10 +171,8 @@ class MXCRPlugin(Plugin):
 
     def _check_copy_permission(self, player) -> bool:
         """检查玩家是否有复制(保存)权限"""
-        # 已授权玩家（OP/授权玩家/管理员）直接有权限
         if self._perm_mgr.is_authorized(player.name, player.is_op):
             return True
-        # 普通玩家权限系统
         if self._config_mgr.normal_player_permissions_enabled:
             return self.normal_perm_manager.check_permission(player.unique_id, "allow_copy")
         return False
@@ -219,8 +184,7 @@ class MXCRPlugin(Plugin):
         if self._perm_mgr.is_game_admin(player.name, player.is_op):
             return True  # 管理员无限制
         p_uuid = str(player.unique_id)
-        p_name = player.name
-        count = self._db_mgr.get_structure_count(p_uuid, p_name)
+        count = self._store.count_owned_structures(p_uuid)
         # 授权玩家使用全局上限；普通玩家使用普通权限系统的 max_structures
         if self._perm_mgr.is_authorized(player.name, player.is_op):
             limit = self._config_mgr.authorized_save_limit
@@ -234,7 +198,7 @@ class MXCRPlugin(Plugin):
 
     def _check_normal_permission(self, player, permission_key: str) -> bool:
         """
-        检查普通玩家的细粒度权限（v1.0.0 修复：此前多个权限键定义了但从未执行）
+        检查普通玩家的细粒度权限。
 
         OP / 授权玩家 / 游戏管理员直接放行；
         普通玩家在启用普通权限系统时按权限键判断，否则拒绝。
@@ -253,13 +217,19 @@ class MXCRPlugin(Plugin):
             return self._normal_perm_mgr.get_limit(player.unique_id, limit_key, default=default)
         return default
 
+    def _require_backend(self, player) -> bool:
+        """检查 StructBridge 后端可用性，不可用时给玩家明确提示。"""
+        ok, msg = self._backend.ensure()
+        if not ok:
+            player.send_message("§c[MXCR] StructBridge 后端不可用，无法执行此操作!")
+            player.send_message("§7请安装 StructBridge 插件并确认其为最新版 (含 Python API)")
+            return False
+        return True
+
     # ========== 命令处理 ==========
 
     def on_command(self, sender: CommandSender, command: Command, args: list) -> bool:
-        """
-        命令处理入口（v1.0.0: 添加全局异常保护，
-        任何子命令抛出异常都不会传播到服务器核心）
-        """
+        """命令处理入口（全局异常保护）"""
         try:
             return self._dispatch_command(sender, command, args)
         except Exception as e:
@@ -332,7 +302,7 @@ class MXCRPlugin(Plugin):
                 player.send_message("§b[MXCR] §l===== 权限列表 =====")
                 player.send_message(f"§6授权玩家: §f{', '.join(authorized) if authorized else '无'}")
                 player.send_message(f"§6游戏管理员: §f{', '.join(admins) if admins else '无'}")
-                player.send_message(f"§7(服务器 OP 默认拥有所有权限)")
+                player.send_message("§7(服务器 OP 默认拥有所有权限)")
                 return True
 
             # /mxcr admin <name>
@@ -377,15 +347,15 @@ class MXCRPlugin(Plugin):
 
             # /mxcr bridge
             elif sub == "bridge":
-                self._check_bridge_connection(player)
+                self._check_bridge_status(player)
                 return True
 
-            # /mxcr undo（权限校验在 undo_operation 内部，命令与表单路径统一）
+            # /mxcr undo
             elif sub == "undo":
                 self.undo_operation(player)
                 return True
 
-            # /mxcr redo（权限校验在 redo_operation 内部，命令与表单路径统一）
+            # /mxcr redo
             elif sub == "redo":
                 self.redo_operation(player)
                 return True
@@ -403,12 +373,6 @@ class MXCRPlugin(Plugin):
             player.send_message("§c[MXCR] 你没有权限使用此插件!")
             player.send_message("§7请联系服务器管理员使用 /mxcr op <你的名字> 授权")
             return True
-
-        player_uuid_str = str(player.unique_id)
-        player_name = player.name
-
-        # 初始化玩家数据文件夹
-        self._db_mgr.init_player_dir(player_uuid_str, player_name)
 
         # 无参数 - 打开主菜单
         if len(args) == 0:
@@ -435,7 +399,7 @@ class MXCRPlugin(Plugin):
             self._form_mgr.show_my_structures(player)
         else:
             player.send_message(f"§c未知子命令: {sub}")
-            player.send_message("§7用法: /mxcr [start|ok|cancel|list|op|deop|oplist|admin|deadmin|reload]")
+            player.send_message("§7用法: /mxcr [start|ok|cancel|list|undo|redo|op|deop|oplist|admin|deadmin|reload|bridge]")
 
         return True
 
@@ -443,7 +407,7 @@ class MXCRPlugin(Plugin):
 
     @event_handler
     def on_player_interact(self, event: PlayerInteractEvent):
-        """玩家交互事件处理（v1.0.0: 添加全局异常保护）"""
+        """玩家交互事件处理（全局异常保护）"""
         try:
             self._handle_player_interact(event)
         except Exception as e:
@@ -482,8 +446,6 @@ class MXCRPlugin(Plugin):
                 # 检查权限
                 if self._check_copy_permission(player) or self._check_full_permission(player):
                     event.is_cancelled = True
-                    # 初始化玩家数据文件夹
-                    self._db_mgr.init_player_dir(str(player.unique_id), player_name)
                     self._form_mgr.show_main_menu(player)
                 return
 
@@ -516,12 +478,12 @@ class MXCRPlugin(Plugin):
         if item_type_id == modify_item and selection.pos1 is not None and selection.pos2 is not None:
             self._selection_mgr.set_position(player_name, pos, dim_name, 2)
             player.send_message(f"§a[MXCR] §l第二个点已修改: §e({pos[0]}, {pos[1]}, {pos[2]})")
-            
+
             size = selection.get_size()
             volume = selection.get_volume()
             player.send_message(f"§b选区尺寸: §e{size[0]}§7x§e{size[1]}§7x§e{size[2]}")
             player.send_message(f"§b选区体积: §e{volume} §b方块")
-            
+
             # 重新启动粒子显示
             self._start_particle_loop(player, player_name)
             return
@@ -560,9 +522,7 @@ class MXCRPlugin(Plugin):
             self._selection_mgr.cancel_particle_task(player_name)
             self._spawn_point_particles(player, pos)
 
-    # 注意: on_player_quit 已合并到文件末尾的统一事件处理器中
-
-    # ========== 粒子效果 ===========
+    # ========== 粒子效果 ==========
 
     def _get_particle_id(self) -> str:
         """获取当前配置的粒子 ID"""
@@ -700,11 +660,16 @@ class MXCRPlugin(Plugin):
         self._selection_mgr.clear_selection(player_name)
         player.send_message("§a[MXCR] 已停止选区并清除粒子效果")
 
-    def save_structure_for_player(self, player, name: str, preserve_air: bool,
-                                   relocate: bool = False, excluded_blocks: list = None,
-                                   preserve_water: bool = True, preserve_lava: bool = True,
-                                   reliable_mode: bool = False):
-        """保存建筑"""
+    # ================================================================
+    #  保存 (StructBridge 引擎导出)
+    # ================================================================
+
+    def save_structure_for_player(self, player, name: str, relocate: bool = False):
+        """
+        保存建筑：引擎原生导出选区为 .mcstructure / .bundle。
+
+        区块加载由 StructBridge 自行处理（tickingarea + 必要时传送本玩家）。
+        """
         player_name = player.name
         selection = self._selection_mgr.get_selection(player_name)
 
@@ -712,774 +677,620 @@ class MXCRPlugin(Plugin):
             player.send_message("§c[MXCR] 选区未完成!")
             return
 
-        player_uuid_str = str(player.unique_id)
-        dimension = player.dimension
+        if not self._require_backend(player):
+            return
 
-        # 获取排除方块列表
-        excluded = list(self._config_mgr.excluded_blocks)
-        if excluded_blocks:
-            excluded.extend(excluded_blocks)
-        
-        # 根据保留水和岩浆的设置添加到排除列表
-        if not preserve_water:
-            excluded.extend(["minecraft:water", "minecraft:flowing_water"])
-        if not preserve_lava:
-            excluded.extend(["minecraft:lava", "minecraft:flowing_lava"])
+        # v1.1.0: 搬迁模式权限校验
+        if relocate and not self._check_normal_permission(player, "allow_move_mode"):
+            player.send_message("§c[MXCR] 你没有使用搬迁模式的权限!")
+            return
 
-        # 检查方块数量限制 (智能计算)
         min_pos, max_pos = selection.get_bounds()
         volume = selection.get_volume()
-        max_vol = self._config_mgr.max_block_count
+        dim_name = player.dimension.name
 
-        # v1.0.0: 普通玩家的单次复制方块数上限（授权玩家不受此限制）
+        # 引擎 Y 轴上限 384 格（structbridge 硬限制）
+        if (max_pos[1] - min_pos[1] + 1) > 384:
+            player.send_message(f"§c[MXCR] 选区 Y 轴高度 ({max_pos[1] - min_pos[1] + 1}) 超过引擎上限 384!")
+            return
+
+        # 方块数限制（v1.1.0: 按选区体积计，引擎为全量捕获）
+        max_vol = self._config_mgr.max_block_count
         normal_copy_limit = self._get_normal_limit(
             player, "max_blocks_per_copy", default=max_vol
         )
         if normal_copy_limit > 0:
             max_vol = min(max_vol, normal_copy_limit)
+        if volume > max_vol:
+            player.send_message(f"§c[MXCR] 选区体积 ({volume}) 超过最大限制 ({max_vol})!")
+            return
 
-        # 如果不保留空气,先估算实际方块数
-        if not preserve_air:
-            # 体积很大时跳过精确计算,直接用体积估算
-            if volume <= max_vol * 2:
-                actual = self._struct_op.count_actual_blocks(
-                    dimension, selection, preserve_air, excluded
-                )
-                if actual > max_vol:
-                    player.send_message(f"§c[MXCR] 实际方块数 ({actual}) 超过最大限制 ({max_vol})!")
-                    return
-            else:
-                player.send_message(f"§c[MXCR] 选区体积 ({volume}) 过大!")
-                return
-        else:
-            if volume > max_vol:
-                player.send_message(f"§c[MXCR] 选区体积 ({volume}) 超过最大限制 ({max_vol})!")
-                return
+        # 保存数量上限
+        if not self._check_save_limit(player):
+            player.send_message("§c[MXCR] 你已达到保存上限，请先删除一些旧建筑!")
+            return
 
-        # 检查区块加载
-        if not self._struct_op.check_chunks_loaded(dimension, min_pos, max_pos):
-            # 先显示进度条，再传送（避免传送前无进度条的空白期）
-            from endstone.boss import BarColor as _BarColor
-            self._progress_mgr.show_progress(player, "§e正在准备复制...", 0.05, _BarColor.YELLOW)
-            player.send_message("§e[MXCR] 部分区块未加载,正在传送您到选区中心...")
-            center = StructureOperator.get_center_position(min_pos, max_pos)
+        structure_id, sb_key = new_building_key()
+        is_bundle = is_bundle_region(min_pos[0], min_pos[2], max_pos[0], max_pos[2])
+        bounds = (min_pos[0], min_pos[1], min_pos[2], max_pos[0], max_pos[1], max_pos[2])
 
-            from endstone.level import Location
-            loc = Location(dimension, float(center[0]), float(center[1]), float(center[2]))
-            player.teleport(loc)
+        from endstone.boss import BarColor
+        self._progress_mgr.show_progress(
+            player, "§e正在通过引擎复制建筑...", 0.1, BarColor.YELLOW
+        )
+        player.send_message("§e[MXCR] §l正在复制建筑,请稍候...")
+        if is_bundle:
+            player.send_message("§7区域超过 64x64，将自动分片为结构束保存")
 
-            def delayed_save():
-                # v1.0.0: 延迟任务中重新获取玩家对象，避免捕获过期的 player 引用
-                p = self.server.get_player(player_name)
+        def on_export_done(stage: int, message: str):
+            p = self.server.get_player(player_name)
+            try:
                 if p is None:
                     self._progress_mgr.hide_progress_by_name(player_name)
                     self.logger.info(f"Player {player_name} offline, save cancelled")
                     return
-                self._do_save(p, name, preserve_air, excluded, selection, relocate, reliable_mode)
 
-            self.server.scheduler.run_task(self, delayed_save, delay=40)
-            return
+                if stage != STAGE_OK:
+                    self._progress_mgr.hide_progress(p)
+                    p.send_message(f"§c[MXCR] 复制失败: {self._backend.stage_message(stage)}")
+                    p.send_message(f"§7{message}")
+                    self.logger.warning(f"[MXCR] export failed: {message}")
+                    return
 
-        self._do_save(player, name, preserve_air, excluded, selection, relocate, reliable_mode)
-
-    def _do_save(self, player, name: str, preserve_air: bool,
-                 excluded_blocks: list, selection, relocate: bool = False,
-                 reliable_mode: bool = False):
-        """执行保存操作（使用异步进度条，带容错处理）"""
-        from endstone.boss import BarColor
-
-        # 保存玩家信息（后续闭包中使用，避免访问已离线的 player 对象）
-        player_name = player.name
-        player_uuid_str = str(player.unique_id)
-        dimension = player.dimension
-        dim_name = dimension.name
-        
-        # 计算建筑覆盖的区块数量
-        min_pos, max_pos = selection.get_bounds()
-        chunks = self._chunk_loader.get_chunks_in_bounds(min_pos, max_pos)
-        chunk_count = len(chunks)
-        
-        # 如果跨越多个区块，使用智能分块保存
-        if chunk_count > 1:
-            # 先显示进度条，再进入分块流程（避免传送前无进度条的空白期）
-            self._progress_mgr.show_progress(
-                player, f"§e正在准备复制 ({chunk_count} 个区块)...",
-                0.0, BarColor.YELLOW
-            )
-            player.send_message("§e[MXCR] §l正在复制建筑,请稍候...")
-            self._chunk_loader.save_with_chunk_loading(
-                player, name, preserve_air, excluded_blocks, selection, relocate, reliable_mode
-            )
-            return
-        
-        # 单区块建筑，使用原有逻辑（增加容错）
-
-        # 第1步：显示/更新进度条
-        # 如果进度条已由 save_structure_for_player 提前创建（区块未加载情况），则更新而非重建
-        if self._progress_mgr.has_progress(player):
-            self._progress_mgr.update_progress(player, 0.1, "§e正在复制建筑...")
-        else:
-            self._progress_mgr.show_progress(player, "§e正在复制建筑...", 0.1, BarColor.YELLOW)
-        player.send_message("§e[MXCR] §l正在复制建筑,请稍候...")
-
-        # 第2步：延迟2tick后执行实际操作
-        def do_copy():
-            # 容错：检查玩家是否仍在线
-            if self.server.get_player(player_name) is None:
-                self._progress_mgr.hide_progress_by_name(player_name)
-                self.logger.info(f"Player {player_name} offline, save cancelled")
-                return
-
-            try:
-                p = self.server.get_player(player_name)
-                dim = self.server.level.get_dimension(dim_name)
-
-                self._progress_mgr.update_progress(p, 0.3, "§e正在扫描方块...")
-
-                metadata, blocks, entities = self._struct_op.copy_structure(
-                    dimension=dim,
-                    selection=selection,
+                # 写入元数据
+                meta = StructureMetadata(
+                    structure_id=structure_id,
+                    sb_key=sb_key,
                     name=name,
-                    player_uuid_str=player_uuid_str,
+                    min_x=bounds[0], min_y=bounds[1], min_z=bounds[2],
+                    max_x=bounds[3], max_y=bounds[4], max_z=bounds[5],
+                    timestamp=int(time.time()),
+                    player_uuid=str(player.unique_id),
                     player_name=player_name,
-                    preserve_air=preserve_air,
-                    excluded_blocks=excluded_blocks
+                    dimension=dim_name,
+                    is_bundle=is_bundle,
+                )
+                self._store.add_structure(meta)
+
+                self._progress_mgr.update_progress(p, 0.9, "§a保存完成!")
+                p.send_message(f"§a[MXCR] §l建筑 §e{name} §a已保存!")
+                p.send_message(
+                    f"§f区域体积 §e{volume} §f(ID: §b{structure_id}§f)"
+                    + (" §7[结构束]" if is_bundle else "")
                 )
 
-                if entities:
-                    self.logger.info(
-                        f"[MXCR] 扫描到 {len(entities)} 个实体，待读取 SAPI 数据"
+                # 搬迁模式 - 保存后清除原区域
+                if relocate:
+                    self._progress_mgr.update_progress(p, 0.95, "§e正在清除原区域...")
+                    p.send_message("§e[MXCR] 搬迁模式: 正在清除原区域...")
+                    # 撤销条目：恢复 = 把刚保存的建筑贴回原区域
+                    entry = UndoEntry(
+                        restore_key=sb_key, bounds=bounds,
+                        dimension=dim_name, description=f"搬迁建筑 {name}",
                     )
-
-                # 更新进度
-                self._progress_mgr.update_progress(p, 0.5, "§e正在读取容器数据...")
-
-                # 定义保存函数（必须先于容器读取逻辑，因为回调中会引用它）
-                def do_save_data():
-                    # 容错：检查玩家是否仍在线
-                    p2 = self.server.get_player(player_name)
-                    if p2 is None:
-                        self._progress_mgr.hide_progress_by_name(player_name)
-                        self.logger.info(f"Player {player_name} offline during save")
-                        return
-
-                    try:
-                        structure_id = self._db_mgr.save_structure(
-                            player_uuid_str, player_name, metadata, blocks, entities
-                        )
-
-                        self._progress_mgr.update_progress(p2, 0.9, "§a保存完成!")
-
-                        p2.send_message(f"§a[MXCR] §l建筑 §e{name} §a已保存!")
-                        p2.send_message(f"§f共保存了 §e{len(blocks)} §f个方块 (ID: §b{structure_id}§f)")
-                        if entities:
-                            p2.send_message(f"§f共保存了 §e{len(entities)} §f个实体")
-
-                        # 搬迁模式 - 保存后删除原方块
-                        if relocate:
-                            self._progress_mgr.update_progress(p2, 0.95, "§e正在清除原方块...")
-                            p2.send_message("§e[MXCR] 搬迁模式: 正在删除原方块...")
-                            min_pos, max_pos = selection.get_bounds()
-
-                            dim2 = self.server.level.get_dimension(dim_name)
-                            # 记录要删除的方块（用于撤销）
-                            deleted_blocks = []
-                            for x in range(min_pos[0], max_pos[0] + 1):
-                                for y in range(min_pos[1], max_pos[1] + 1):
-                                    for z in range(min_pos[2], max_pos[2] + 1):
-                                        try:
-                                            block = dim2.get_block_at(x, y, z)
-                                            if block.type != "minecraft:air":
-                                                bd = block.data
-                                                states = dict(bd.block_states) if bd.block_states else {}
-                                                deleted_blocks.append(BlockRecord(
-                                                    x=x, y=y, z=z,
-                                                    block_type=block.type,
-                                                    block_data=0,
-                                                    block_states=states
-                                                ))
-                                        except Exception:
-                                            pass
-
-                            cleared = self._struct_op.clear_area(dim2, min_pos, max_pos)
-                            p2.send_message(f"§a[MXCR] 已清除 §e{cleared} §a个方块")
-
-                            # 记录到撤销历史
-                            if deleted_blocks:
-                                self._undo_mgr.record_action(
-                                    player_name=player_name,
-                                    action_type="save_relocate",
-                                    blocks=deleted_blocks,
-                                    dimension=dim_name,
-                                    description=f"搬迁建筑 {name}"
-                                )
-
-                        # 清除选区和粒子
-                        self._selection_mgr.clear_selection(player_name)
-
-                        # 延迟隐藏进度条（让玩家看到完成状态）
-                        def hide_bar():
-                            try:
-                                p3 = self.server.get_player(player_name)
-                                if p3 is not None:
-                                    self._progress_mgr.hide_progress(p3)
-                                else:
-                                    self._progress_mgr.hide_progress_by_name(player_name)
-                            except Exception:
-                                self._progress_mgr.hide_progress_by_name(player_name)
-                        self.server.scheduler.run_task(self, hide_bar, delay=30)
-
-                    except Exception as e:
-                        try:
-                            p2 = self.server.get_player(player_name)
-                            if p2 is not None:
-                                self._progress_mgr.hide_progress(p2)
-                                p2.send_message(f"§c[MXCR] 保存失败: {str(e)}")
-                            else:
-                                self._progress_mgr.hide_progress_by_name(player_name)
-                        except Exception:
-                            self._progress_mgr.hide_progress_by_name(player_name)
-                        self.logger.error(f"Failed to save structure: {e}")
-
-                # 异步读取所有容器方块的物品数据
-                container_blocks = [
-                    b for b in blocks if b.nbt_data == "__CONTAINER__"
-                ]
-
-                if container_blocks:
-                    # 有容器方块，需要异步读取
-                    pending_count = [len(container_blocks)]
-
-                    def on_all_containers_done():
-                        """all container reads finished; then read entity SAPI data if any"""
-                        self._progress_mgr.update_progress(
-                            self.server.get_player(player_name) or p,
-                            0.55, "§e正在读取实体数据..."
-                        )
-                        self._do_read_entity_sapi_data(
-                            entities, dim_name, min_pos, max_pos,
-                            player_name, p, do_save_data
-                        )
-
-                    def make_container_callback(block_info: BlockInfo):
-                        def callback(slots, error):
-                            if error:
-                                # 容器读取失败，保留占位符为 None
-                                block_info.nbt_data = None
-                                self.logger.warning(
-                                    f"[MXCR] 容器读取失败 "
-                                    f"({block_info.x},{block_info.y},{block_info.z}): {error}"
-                                )
-                            else:
-                                # 将物品列表序列化为 JSON 字符串存入 nbt_data
-                                block_info.nbt_data = json.dumps(
-                                    slots, ensure_ascii=False
-                                ) if slots else None
-
-                            pending_count[0] -= 1
-                            if pending_count[0] <= 0:
-                                on_all_containers_done()
-                        return callback
-
-                    for cb in container_blocks:
-                        self._container_mgr.request_read(
-                            x=cb.x, y=cb.y, z=cb.z,
-                            dim_name=dim_name,
-                            callback=make_container_callback(cb)
-                        )
-                    # 不立即执行 do_save_data，由回调驱动
-                else:
-                    # 无容器方块，直接读取实体 SAPI 数据
-                    self._progress_mgr.update_progress(p, 0.55, "§e正在读取实体数据...")
-                    self._do_read_entity_sapi_data(
-                        entities, dim_name, min_pos, max_pos,
-                        player_name, p, do_save_data
+                    self._store.push_undo_entry("undo", player_name, entry)
+                    self._clear_region_async(
+                        p, bounds, dim_name,
+                        on_done=lambda ok, cleared: self._on_relocate_cleared(
+                            player_name, ok, cleared),
                     )
+                    return  # 进度条由搬迁流程收尾
+
+                # 清除选区和粒子
+                self._selection_mgr.clear_selection(player_name)
+                self._finish_progress(player_name, 1.0, "§a保存完成!")
 
             except Exception as e:
+                self.logger.error(f"Failed to finish save: {e}")
+                self._progress_mgr.hide_progress_by_name(player_name)
+
+        job = self._backend.export_region(
+            sb_key, min_pos, max_pos, dim_name,
+            tp_player=player_name, on_done=on_export_done,
+        )
+        if job == 0:
+            self._progress_mgr.hide_progress(player)
+            player.send_message("§c[MXCR] 复制请求被拒绝，请检查选区后重试!")
+
+    def _on_relocate_cleared(self, player_name: str, ok: bool, cleared: int):
+        """搬迁清除完成回调"""
+        p = self.server.get_player(player_name)
+        if p is not None:
+            if ok:
+                p.send_message(f"§a[MXCR] 已清除 §e{cleared} §a个方块 (搬迁完成，可用 /mxcr undo 恢复)")
+            else:
+                p.send_message("§c[MXCR] 原区域清除未完全完成，请手动检查!")
+            self._selection_mgr.clear_selection(player_name)
+        self._progress_mgr.hide_progress_by_name(player_name)
+
+    # ---------- 搬迁模式: 分片 /fill 清除区域 ----------
+
+    def _plan_fill_slices(self, bounds: tuple):
+        """
+        把区域切成不超过 FILL_LIMIT 体积的填充片。
+        返回 [(x1,y1,z1,x2,y2,z2), ...]
+        """
+        x1, y1, z1, x2, y2, z2 = bounds
+        dy = y2 - y1 + 1
+        dz = z2 - z1 + 1
+        dx_max = max(1, self.FILL_LIMIT // (dy * dz))
+        slices = []
+        x = x1
+        while x <= x2:
+            xe = min(x + dx_max - 1, x2)
+            slices.append((x, y1, z1, xe, y2, z2))
+            x = xe + 1
+        return slices
+
+    def _region_chunks_loaded(self, dim, bounds: tuple) -> bool:
+        """检查区域覆盖的所有区块是否已加载。"""
+        x1, _, z1, x2, _, z2 = bounds
+        try:
+            loaded = {((c.x), (c.z)) for c in dim.loaded_chunks}
+        except Exception:
+            # API 不可用时按已加载处理，交给 fill 自行容忍
+            return True
+        for cx in range(x1 >> 4, (x2 >> 4) + 1):
+            for cz in range(z1 >> 4, (z2 >> 4) + 1):
+                if (cx, cz) not in loaded:
+                    return False
+        return True
+
+    def _clear_region_async(self, player, bounds: tuple, dim_name: str, on_done):
+        """
+        清除区域为空气（搬迁模式）。
+
+        策略：若区域区块未全部加载，先把玩家传送到区域中心等待加载，
+        然后逐片派发 /fill air（每片间隔 2 tick 防止命令洪泛），完成后送回玩家。
+        """
+        player_name = player.name
+        dim = self.server.level.get_dimension(dim_name)
+        original_loc = player.location
+        cx = (bounds[0] + bounds[3]) // 2
+        cy = bounds[4] + 1
+        cz = (bounds[2] + bounds[5]) // 2
+        need_tp = not self._region_chunks_loaded(dim, bounds)
+        teleported = [False]
+
+        def dispatch_fills():
+            slices = self._plan_fill_slices(bounds)
+            state = {"i": 0, "cleared": 0}
+
+            def next_fill():
+                p = self.server.get_player(player_name)
+                if p is None:
+                    # 玩家离线：fill 不依赖玩家，继续派发
+                    pass
+                if state["i"] >= len(slices):
+                    # 全部派发完成
+                    if teleported[0]:
+                        tp = self.server.get_player(player_name)
+                        if tp is not None:
+                            tp.teleport(original_loc)
+                    on_done(True, state["cleared"])
+                    return
+                s = slices[state["i"]]
+                state["i"] += 1
+                state["cleared"] += (
+                    (s[3] - s[0] + 1) * (s[4] - s[1] + 1) * (s[5] - s[2] + 1)
+                )
+                cmd = f"fill {s[0]} {s[1]} {s[2]} {s[3]} {s[4]} {s[5]} air"
                 try:
-                    p = self.server.get_player(player_name)
-                    if p is not None:
-                        self._progress_mgr.hide_progress(p)
-                        p.send_message(f"§c[MXCR] 复制失败: {str(e)}")
-                    else:
-                        self._progress_mgr.hide_progress_by_name(player_name)
-                except Exception:
-                    self._progress_mgr.hide_progress_by_name(player_name)
-                self.logger.error(f"Failed to copy structure: {e}")
+                    self.server.dispatch_command(self.server.command_sender, cmd)
+                except Exception as e:
+                    self.logger.warning(f"[MXCR] fill 派发失败: {e}")
+                self.server.scheduler.run_task(self, next_fill, delay=2)
 
-        self.server.scheduler.run_task(self, do_copy, delay=2)
+            next_fill()
 
-    def _do_read_entity_sapi_data(
-        self, entities, dim_name: str, min_pos: tuple, max_pos: tuple,
-        player_name: str, progress_player, next_fn
-    ):
-        """
-        辅助方法：异步请求 SAPI 读取选区内实体的扩展数据，完成后调用 next_fn。
-
-        如果没有实体，直接调用 next_fn。
-
-        Args:
-            entities:       EntityInfo 列表（会就地填充 sapi_data 字段）
-            dim_name:       维度名称
-            min_pos:        选区最小坐标
-            max_pos:        选区最大坐标
-            player_name:    玩家名（用于获取在线玩家对象）
-            progress_player:进度条玩家对象（可能已离线，仅用于更新进度）
-            next_fn:        实体数据读取完成后调用的无参数函数
-        """
-        if not entities:
-            # 无实体，直接进入下一步
-            self._progress_mgr.update_progress(
-                self.server.get_player(player_name) or progress_player,
-                0.6, "§e正在保存数据..."
-            )
-            self.server.scheduler.run_task(self, next_fn, delay=2)
+        if not need_tp:
+            dispatch_fills()
             return
 
-        def on_sapi_entities(entities_list, error):
-            """实体 SAPI 数据读取回调（通过位置匹配）"""
-            if error:
-                self.logger.warning(
-                    f"[MXCR] 实体 SAPI 数据读取失败: {error}，将仅保存 Endstone 侧数据"
-                )
-            else:
-                # 通过位置匹配将 SAPI 数据填充到对应的 EntityInfo
-                # entities_list 是 SAPI 返回的列表，每个元素含 loc_x/y/z
-                # entities 是 Endstone 侧扫描到的列表，每个元素含 rel_x/y/z
-                # 两者都是相对于 min_pos 的相对坐标（Endstone 侧）或绝对坐标（SAPI 侧）
-                if entities_list:
-                    for sapi_ent in entities_list:
-                        sx = sapi_ent.get("loc_x", 0)
-                        sy = sapi_ent.get("loc_y", 0)
-                        sz = sapi_ent.get("loc_z", 0)
-                        best_ei = None
-                        best_dist = 1.0  # 最大匹配距离（格）
-                        for ei in entities:
-                            # EntityInfo 中存的是相对坐标，加上 min_pos 得绝对坐标
-                            ex = ei.rel_x + min_pos[0]
-                            ey = ei.rel_y + min_pos[1]
-                            ez = ei.rel_z + min_pos[2]
-                            dist = ((ex - sx) ** 2 + (ey - sy) ** 2 + (ez - sz) ** 2) ** 0.5
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_ei = ei
-                        if best_ei is not None:
-                            best_ei.sapi_data = sapi_ent
+        # 传送到区域中心，轮询等待区块加载
+        from endstone.level import Location
+        try:
+            player.teleport(Location(dim, float(cx), float(cy), float(cz)))
+            teleported[0] = True
+        except Exception as e:
+            self.logger.warning(f"[MXCR] 搬迁传送失败: {e}")
 
-            # 无论是否成功，都进入下一步
-            self._progress_mgr.update_progress(
-                self.server.get_player(player_name) or progress_player,
-                0.6, "§e正在保存数据..."
-            )
-            self.server.scheduler.run_task(self, next_fn, delay=2)
+        attempts = [0]
+        max_attempts = 40  # 40 * 10 tick = 20 秒
 
-        self._entity_mgr.request_read_sapi_data(
-            dim_name=dim_name,
-            min_pos=min_pos,
-            max_pos=max_pos,
-            callback=on_sapi_entities,
-        )
+        def wait_tick():
+            attempts[0] += 1
+            d = self.server.level.get_dimension(dim_name)
+            if self._region_chunks_loaded(d, bounds):
+                dispatch_fills()
+                return
+            if attempts[0] >= max_attempts:
+                p = self.server.get_player(player_name)
+                if p is not None:
+                    p.send_message("§e[MXCR] 区块加载超时，将尽力清除已加载部分...")
+                dispatch_fills()
+                return
+            self.server.scheduler.run_task(self, wait_tick, delay=10)
+
+        self.server.scheduler.run_task(self, wait_tick, delay=10)
+
+    # ================================================================
+    #  加载/粘贴 (StructBridge 引擎放置)
+    # ================================================================
 
     def load_structure_for_player(self, player, structure_id: str,
-                                   target_pos: tuple,
-                                   source_type: str = "player",
-                                   source_dir: str = "",
-                                   reliable_mode: bool = False,
-                                   preloaded_blocks=None,
-                                   preloaded_meta=None,
-                                   preloaded_entities=None):
-        """加载建筑（智能分块版本，与复制流程对称）
+                                   target_pos: tuple, source_type: str = "player"):
+        """
+        粘贴建筑：先引擎导出目标区域快照（用于撤销），再放置建筑。
 
         Args:
-            preloaded_blocks:   预变换后的方块列表（旋转/翻转后直接传入，跳过数据库读取）
-            preloaded_meta:     预变换后的元数据（旋转/翻转后的尺寸信息）
-            preloaded_entities: 预变换后的实体列表
+            target_pos: 新包围盒最小角
+            source_type: "player"(自己的) / "public"(公开) / "admin"(任意，管理员)
         """
-        from endstone.boss import BarColor
-
-        player_uuid_str = str(player.unique_id)
         player_name = player.name
-        dimension = player.dimension
+        if not self._require_backend(player):
+            return
 
-        # v1.0.0: 粘贴/加载权限检查（own → allow_paste; public → allow_public_load）
+        # 权限与归属校验
         if source_type == "public":
             if not self._check_normal_permission(player, "allow_public_load"):
                 player.send_message("§c[MXCR] 你没有加载公开建筑的权限!")
                 return
+            meta = self._store.list_public_structures()
+            meta = next((m for m in meta if m.structure_id == structure_id), None)
+        elif source_type == "admin":
+            if not self._perm_mgr.is_game_admin(player.name, player.is_op):
+                player.send_message("§c[MXCR] 只有管理员可以执行此操作!")
+                return
+            meta = self._store.get_structure(structure_id)
         else:
             if not self._check_normal_permission(player, "allow_paste"):
                 player.send_message("§c[MXCR] 你没有粘贴建筑的权限!")
                 return
+            meta = self._store.get_owned_structure(
+                str(player.unique_id), player_name, structure_id
+            )
 
-        # 如果有预加载数据（旋转/翻转后），直接使用，否则从数据库读取元数据
-        if preloaded_meta is not None:
-            metadata = preloaded_meta
-        else:
-            if source_type == "public":
-                metadata = self._db_mgr.get_public_structure_metadata(structure_id)
-            elif source_type == "admin" and source_dir:
-                metadata = self._db_mgr.get_metadata_from_dir(source_dir, structure_id)
-            else:
-                metadata = self._db_mgr.get_structure_metadata(
-                    player_uuid_str, structure_id, player_name
-                )
-
-        if metadata is None:
+        if meta is None:
             player.send_message("§c[MXCR] 建筑不存在!")
             return
 
-        # 计算目标区域范围
-        offset_x = target_pos[0] - metadata.min_x
-        offset_y = target_pos[1] - metadata.min_y
-        offset_z = target_pos[2] - metadata.min_z
-        target_max = (
-            metadata.max_x + offset_x,
-            metadata.max_y + offset_y,
-            metadata.max_z + offset_z
+        # 目标维度 = 玩家当前维度
+        dim_name = player.dimension.name
+        size = meta.get_size()
+        target_bounds = (
+            int(target_pos[0]), int(target_pos[1]), int(target_pos[2]),
+            int(target_pos[0]) + size[0] - 1,
+            int(target_pos[1]) + size[1] - 1,
+            int(target_pos[2]) + size[2] - 1,
         )
 
-        # 计算区块数量，决定走哪条路径
-        chunks = self._chunk_loader.get_chunks_in_bounds(target_pos, target_max)
-        chunk_count = len(chunks)
+        from endstone.boss import BarColor
+        self._progress_mgr.show_progress(player, "§a正在粘贴建筑...", 0.1, BarColor.GREEN)
+        player.send_message("§a[MXCR] §l正在粘贴建筑,请稍候...")
 
-        # 先显示进度条（无论哪条路径，立刻给玩家反馈）
-        self._progress_mgr.show_progress(
-            player, f"§a正在准备加载 ({chunk_count} 个区块)...", 0.05, BarColor.GREEN
-        )
-        player.send_message("§e[MXCR] §l正在加载建筑,请稍候...")
-
-        if chunk_count > 1:
-            # 多区块：使用智能分块加载（逐区块 TP，与复制流程对称）
-            # 注意：预加载数据仅支持单区块快速路径；多区块时忽略预加载（旋转建筑通常不会跨多区块）
-            self._chunk_loader.load_with_chunk_loading(
-                player, structure_id, target_pos, source_type, source_dir, reliable_mode
-            )
-        else:
-            # 单区块：使用原有快速路径，支持预加载数据
-            self._do_load(
-                player, structure_id, target_pos, source_type, source_dir,
-                preloaded_blocks=preloaded_blocks,
-                preloaded_meta=preloaded_meta,
-                preloaded_entities=preloaded_entities,
+        if meta.dimension != dim_name:
+            player.send_message(
+                f"§e[MXCR] 注意: 建筑原维度为 {meta.dimension}，将粘贴到当前维度 {dim_name}"
             )
 
-    def _do_load(self, player, structure_id: str, target_pos: tuple,
-                 source_type: str = "player", source_dir: str = "",
-                 preloaded_blocks=None, preloaded_meta=None, preloaded_entities=None):
-        """执行加载操作（单区块快速路径，内存优化版）"""
+        def do_place():
+            self._paste_with_snapshot(
+                player_name=player_name,
+                sb_key=meta.sb_key,
+                structure_name=meta.name,
+                target_bounds=target_bounds,
+                dim_name=dim_name,
+                tp_player=player_name,
+            )
+
+        # 延迟 2 tick，避免阻塞表单回调线程
+        self.server.scheduler.run_task(self, do_place, delay=2)
+
+    def _paste_with_snapshot(self, player_name: str, sb_key: str,
+                              structure_name: str, target_bounds: tuple,
+                              dim_name: str, tp_player: str):
+        """
+        粘贴流程核心：
+        1. 引擎导出目标区域当前状态 -> 撤销快照
+        2. 引擎放置建筑
+        3. 记录撤销条目（恢复 = 贴回快照）
+        快照失败时警告并继续放置（该操作将不可撤销）。
+        """
         from endstone.boss import BarColor
 
-        # 保存玩家信息（避免闭包中访问已离线的 player 对象）
-        player_name = player.name
-        player_uuid_str = str(player.unique_id)
-        dim_name = player.dimension.name
+        snap_key = new_snapshot_key()
+        snap_min = (target_bounds[0], target_bounds[1], target_bounds[2])
+        snap_max = (target_bounds[3], target_bounds[4], target_bounds[5])
 
-        # 更新进度条（已由调用方提前显示）
-        if self._progress_mgr.has_progress(player):
-            self._progress_mgr.update_progress(player, 0.1, "§a正在加载建筑...")
-        else:
-            self._progress_mgr.show_progress(player, "§a正在加载建筑...", 0.1, BarColor.GREEN)
-
-        # 延迟2tick后执行，避免阻塞主线程
-        def do_load_single():
+        def after_snapshot(stage: int, message: str):
             p = self.server.get_player(player_name)
-            if p is None:
-                self._progress_mgr.hide_progress_by_name(player_name)
-                self.logger.info(f"Player {player_name} offline, load cancelled")
-                return
-
             try:
-                dim = self.server.level.get_dimension(dim_name)
-                self._progress_mgr.update_progress(p, 0.2, "§a正在读取数据...")
-
-                # 一次性读取元数据、方块数据和实体数据
-                # 如果有预加载数据（旋转/翻转后），直接使用，跳过数据库读取
-                if preloaded_blocks is not None and preloaded_meta is not None:
-                    metadata = preloaded_meta
-                    blocks_to_place = preloaded_blocks
-                    entities_to_spawn = preloaded_entities if preloaded_entities is not None else []
-                elif source_type == "public":
-                    metadata = self._db_mgr.get_public_structure_metadata(structure_id)
-                    blocks_to_place = self._db_mgr.get_public_structure_blocks(structure_id)
-                    entities_to_spawn = self._db_mgr.get_public_structure_entities(structure_id)
-                elif source_type == "admin" and source_dir:
-                    metadata = self._db_mgr.get_metadata_from_dir(source_dir, structure_id)
-                    blocks_to_place = self._db_mgr.get_blocks_from_dir(source_dir, structure_id)
-                    entities_to_spawn = self._db_mgr.get_entities_from_dir(source_dir, structure_id)
-                else:
-                    metadata = self._db_mgr.get_structure_metadata(
-                        player_uuid_str, structure_id, player_name
-                    )
-                    blocks_to_place = self._db_mgr.get_structure_blocks(
-                        player_uuid_str, structure_id, player_name
-                    )
-                    entities_to_spawn = self._db_mgr.get_structure_entities(
-                        player_uuid_str, structure_id, player_name
-                    )
-
-                if metadata is None or blocks_to_place is None:
-                    self._progress_mgr.hide_progress(p)
-                    p.send_message("§c[MXCR] 建筑数据不存在!")
+                if p is None:
+                    self._progress_mgr.hide_progress_by_name(player_name)
                     return
 
-                self._progress_mgr.update_progress(p, 0.4, "§a正在放置方块...")
+                snap_ok = stage == STAGE_OK
+                if not snap_ok:
+                    # 继续放置，但本操作不可撤销
+                    p.send_message("§e[MXCR] 目标区域快照失败，本次粘贴将无法撤销!")
+                    self.logger.warning(f"[MXCR] snapshot failed: {message}")
 
-                # 计算偏移量
-                offset_x = target_pos[0] - metadata.min_x
-                offset_y = target_pos[1] - metadata.min_y
-                offset_z = target_pos[2] - metadata.min_z
-                struct_name = metadata.name
+                self._progress_mgr.update_progress(p, 0.5, "§a正在放置方块...")
 
-                # 在放置方块前，先扫描目标区域内已存在的实体（用于撤销时恢复）
-                target_min_pos = (
-                    metadata.min_x + offset_x,
-                    metadata.min_y + offset_y,
-                    metadata.min_z + offset_z,
-                )
-                target_max_pos = (
-                    metadata.max_x + offset_x,
-                    metadata.max_y + offset_y,
-                    metadata.max_z + offset_z,
-                )
-                original_entities = self._entity_mgr.scan_entities_in_selection(
-                    dim, target_min_pos, target_max_pos
-                )
-
-                # 边放置边记录原方块（避免两个大列表同时占用内存）
-                original_blocks = []
-                placed_count = 0
-                # 收集需要写入容器物品的方块：(new_x, new_y, new_z, slots_json)
-                container_writes = []
-
-                for b in blocks_to_place:
-                    nx = b.x + offset_x
-                    ny = b.y + offset_y
-                    nz = b.z + offset_z
-                    try:
-                        block = dim.get_block_at(nx, ny, nz)
-                        # 记录原方块（用于撤销）
-                        bd = block.data
-                        states = dict(bd.block_states) if bd.block_states else {}
-                        original_blocks.append(BlockRecord(
-                            x=nx, y=ny, z=nz,
-                            block_type=block.type,
-                            block_data=0,
-                            block_states=states
-                        ))
-                        # 如果当前位置是容器方块，先替换为屏障（不会掉落物品）再放置目标方块
-                        try:
-                            if self._container_mgr.is_container_block(block.type):
-                                block.set_type("minecraft:barrier", False)
-                        except Exception:
-                            pass
-                        # 放置方块
-                        if b.block_states and self.server:
-                            try:
-                                block_data = self.server.create_block_data(
-                                    b.block_type, b.block_states
-                                )
-                                block.set_data(block_data, False)
-                            except Exception:
-                                block.set_type(b.block_type, False)
-                        else:
-                            block.set_type(b.block_type, False)
-                        placed_count += 1
-                        # 如果该方块有容器物品数据，加入写入队列
-                        if b.nbt_data and b.nbt_data != "__CONTAINER__":
-                            container_writes.append((nx, ny, nz, b.nbt_data))
-                    except Exception:
-                        pass
-
-                # 放置完成后立即释放大型列表，让 GC 可以回收
-                del blocks_to_place
-
-                # 记录到撤销历史
-                if original_blocks:
-                    self._undo_mgr.record_action(
-                        player_name=player_name,
-                        action_type="load",
-                        blocks=original_blocks,
-                        dimension=dim_name,
-                        description=f"加载建筑 {struct_name}",
-                        entities=original_entities,
-                    )
-                    del original_blocks  # 已交给 undo_mgr，可以释放本地引用
-
-                # 延迟隐藏进度条（必须先于 container_writes 分支，因为回调中会引用）
-                def hide_bar():
-                    try:
-                        p3 = self.server.get_player(player_name)
-                        if p3 is not None:
-                            self._progress_mgr.hide_progress(p3)
-                        else:
-                            self._progress_mgr.hide_progress_by_name(player_name)
-                    except Exception:
-                        self._progress_mgr.hide_progress_by_name(player_name)
-
-                # 异步写入容器物品数据
-                if container_writes:
-                    self._progress_mgr.update_progress(p, 0.9, "§a正在还原容器物品...")
-                    p.send_message(f"§e[MXCR] 正在还原 {len(container_writes)} 个容器的物品...")
-                    pending_writes = [len(container_writes)]
-
-                    def on_all_writes_done():
-                        p_final = self.server.get_player(player_name)
-                        if p_final:
-                            self._progress_mgr.update_progress(p_final, 0.95, "§a正在生成实体...")
-                        # 容器写入完成后，继续恢复实体
-                        self._do_spawn_entities(
-                            entities_to_spawn, dim, target_pos, metadata,
-                            dim_name, player_name, placed_count, hide_bar,
-                            with_containers=True
-                        )
-
-                    def make_write_callback(wx, wy, wz):
-                        def cb(ok, count, error):
-                            if not ok:
-                                self.logger.warning(
-                                    f"[MXCR] 容器写入失败 ({wx},{wy},{wz}): {error}"
-                                )
-                            pending_writes[0] -= 1
-                            if pending_writes[0] <= 0:
-                                on_all_writes_done()
-                        return cb
-
-                    for (wx, wy, wz, slots_json) in container_writes:
-                        try:
-                            slots = json.loads(slots_json)
-                        except Exception:
-                            slots = []
-                            pending_writes[0] -= 1
-                            if pending_writes[0] <= 0:
-                                on_all_writes_done()
-                            continue
-                        self._container_mgr.request_write(
-                            x=wx, y=wy, z=wz,
-                            dim_name=dim_name,
-                            slots=slots,
-                            callback=make_write_callback(wx, wy, wz)
-                        )
-                else:
-                    # 无容器物品，直接进入实体恢复
-                    self._progress_mgr.update_progress(p, 0.95, "§a正在生成实体...")
-                    self._do_spawn_entities(
-                        entities_to_spawn, dim, target_pos, metadata,
-                        dim_name, player_name, placed_count, hide_bar,
-                        with_containers=False
-                    )
-
-            except Exception as e:
-                try:
+                def after_place(pstage: int, pmessage: str):
                     p2 = self.server.get_player(player_name)
-                    if p2 is not None:
-                        self._progress_mgr.hide_progress(p2)
-                        p2.send_message(f"§c[MXCR] 加载失败: {str(e)}")
-                    else:
+                    try:
+                        if p2 is None:
+                            self._progress_mgr.hide_progress_by_name(player_name)
+                            return
+                        if pstage != STAGE_OK:
+                            self._progress_mgr.hide_progress(p2)
+                            p2.send_message(
+                                f"§c[MXCR] 粘贴失败: {self._backend.stage_message(pstage)}")
+                            p2.send_message(f"§7{pmessage}")
+                            return
+                        if snap_ok:
+                            entry = UndoEntry(
+                                restore_key=snap_key, bounds=target_bounds,
+                                dimension=dim_name,
+                                description=f"粘贴建筑 {structure_name}",
+                            )
+                            self._store.push_undo_entry("undo", player_name, entry)
+                        self._finish_progress(player_name, 1.0, "§a粘贴完成!")
+                        p2.send_message(f"§a[MXCR] §l建筑 §e{structure_name} §a已粘贴!")
+                        p2.send_message("§7可用 /mxcr undo 撤销此操作")
+                    except Exception as e:
+                        self.logger.error(f"Failed to finish place: {e}")
                         self._progress_mgr.hide_progress_by_name(player_name)
-                except Exception:
-                    self._progress_mgr.hide_progress_by_name(player_name)
-                self.logger.error(f"Failed to load structure: {e}")
 
-        self.server.scheduler.run_task(self, do_load_single, delay=2)
+                job = self._backend.place_structure(
+                    sb_key, snap_min, dim_name,
+                    tp_player=tp_player, on_done=after_place,
+                )
+                if job == 0:
+                    self._progress_mgr.hide_progress(p)
+                    p.send_message("§c[MXCR] 放置请求被拒绝!")
+            except Exception as e:
+                self.logger.error(f"Failed to place: {e}")
+                self._progress_mgr.hide_progress_by_name(player_name)
 
-    def _do_spawn_entities(
-        self, entities_to_spawn, dimension, target_pos: tuple, metadata,
-        dim_name: str, player_name: str, placed_count: int, hide_bar_fn,
-        with_containers: bool
-    ):
-        """
-        辅助方法：在目标位置逐个生成并恢复实体。
-
-        完成后发送加载完成消息并隐藏进度条。
-
-        Args:
-            entities_to_spawn:  EntityInfo 列表（可为 None 或空列表）
-            dimension:          Endstone Dimension 对象
-            target_pos:         粘贴目标最小坐标
-            metadata:           建筑元数据
-            dim_name:           维度名称
-            player_name:        玩家名
-            placed_count:       已放置方块数（用于完成消息）
-            hide_bar_fn:        隐藏进度条的回调函数
-            with_containers:    是否包含容器物品（用于完成消息）
-        """
-        # 计算目标区域的实际最小坐标（用于 EntityManager.spawn_and_restore_entity）
-        offset_x = target_pos[0] - metadata.min_x
-        offset_y = target_pos[1] - metadata.min_y
-        offset_z = target_pos[2] - metadata.min_z
-        actual_min_pos = (
-            metadata.min_x + offset_x,
-            metadata.min_y + offset_y,
-            metadata.min_z + offset_z,
+        job = self._backend.export_region(
+            snap_key, snap_min, snap_max, dim_name,
+            tp_player=tp_player, on_done=after_snapshot,
         )
+        if job == 0:
+            # 快照请求被拒（不常见）：直接尝试放置
+            p = self.server.get_player(player_name)
+            if p is not None:
+                p.send_message("§e[MXCR] 目标区域快照请求被拒，本次粘贴将无法撤销!")
+            after_snapshot(-1, "export request rejected")
 
-        def finish_load(entity_count: int):
-            """all entities spawned, send final message"""
-            p_final = self.server.get_player(player_name)
-            if p_final:
-                self._progress_mgr.update_progress(p_final, 1.0, "§a加载完成!")
-                if with_containers:
-                    p_final.send_message("§a[MXCR] §l建筑已加载（包含容器物品）!")
-                else:
-                    p_final.send_message("§a[MXCR] §l建筑已加载!")
-                p_final.send_message(f"§f共放置了 §e{placed_count} §f个方块")
-                if entity_count > 0:
-                    p_final.send_message(f"§f共生成了 §e{entity_count} §f个实体")
-            self.server.scheduler.run_task(self, hide_bar_fn, delay=30)
-
-        if not entities_to_spawn:
-            finish_load(0)
-            return
-
-        # 逐个生成实体，全部完成后调用 finish_load
-        total = len(entities_to_spawn)
-        pending = [total]
-        spawned_count = [0]
-
-        def make_entity_done_cb():
-            def on_done(ok, error):
-                if ok:
-                    spawned_count[0] += 1
-                elif error:
-                    self.logger.warning(f"[MXCR] 实体生成失败: {error}")
-                pending[0] -= 1
-                if pending[0] <= 0:
-                    finish_load(spawned_count[0])
-            return on_done
-
-        for entity_info in entities_to_spawn:
-            self._entity_mgr.spawn_and_restore_entity(
-                dimension=dimension,
-                entity_info=entity_info,
-                target_min_pos=actual_min_pos,
-                dim_name=dim_name,
-                on_done=make_entity_done_cb(),
-            )
+    # ================================================================
+    #  删除
+    # ================================================================
 
     def delete_structure_for_player(self, player, structure_id: str):
-        """删除建筑"""
+        """删除自己的建筑"""
         try:
-            # v1.0.0: 删除自己建筑的权限检查
             if not self._check_normal_permission(player, "allow_delete_own"):
                 player.send_message("§c[MXCR] 你没有删除建筑的权限!")
                 return
 
-            player_uuid_str = str(player.unique_id)
-            player_name = player.name
-            metadata = self._db_mgr.get_structure_metadata(
-                player_uuid_str, structure_id, player_name
+            meta = self._store.get_owned_structure(
+                str(player.unique_id), player.name, structure_id
             )
-            if metadata is None:
+            if meta is None:
                 player.send_message("§c[MXCR] 建筑不存在!")
                 return
 
-            self._db_mgr.delete_structure(player_uuid_str, structure_id, player_name)
-            player.send_message(f"§a[MXCR] 建筑 §e{metadata.name} §a已删除!")
+            self._delete_structure_internal(meta)
+            player.send_message(f"§a[MXCR] 建筑 §e{meta.name} §a已删除!")
 
         except Exception as e:
             player.send_message(f"§c[MXCR] 删除失败: {str(e)}")
             self.logger.error(f"Failed to delete structure: {e}")
+
+    def admin_delete_structure(self, player, structure_id: str):
+        """管理员删除任意建筑"""
+        try:
+            if not self._perm_mgr.is_game_admin(player.name, player.is_op):
+                player.send_message("§c[MXCR] 只有管理员可以执行此操作!")
+                return
+            meta = self._store.get_structure(structure_id)
+            if meta is None:
+                player.send_message("§c[MXCR] 建筑不存在!")
+                return
+            self._delete_structure_internal(meta)
+            player.send_message(f"§a[MXCR] 建筑 §e{meta.name} §a已删除!")
+        except Exception as e:
+            player.send_message(f"§c[MXCR] 删除失败: {str(e)}")
+            self.logger.error(f"Failed to admin delete structure: {e}")
+
+    def _delete_structure_internal(self, meta: StructureMetadata):
+        """删除元数据 + 结构文件（库文件/镜像/引擎模板）。"""
+        sb_key = self._store.delete_structure(meta.structure_id)
+        if sb_key is None:
+            return
+        ok, msg = self._backend.delete_structure(sb_key)
+        if not ok:
+            # 元数据已删，文件残留仅记录
+            self.logger.warning(f"[MXCR] 结构文件清理未确认: {msg}")
+
+    def _gc_snapshot_file(self, sb_key: str):
+        """撤销栈淘汰时清理快照文件（仅 mxcrsnap_*）。"""
+        from .structbridge_backend import is_snapshot_key
+        if not is_snapshot_key(sb_key):
+            return
+        if self._store.snapshot_key_referenced(sb_key):
+            return
+        ok, msg = self._backend.delete_structure(sb_key)
+        if not ok:
+            self.logger.warning(f"[MXCR] 快照清理失败 ({sb_key}): {msg}")
+
+    # ================================================================
+    #  公开 / 导入 (管理员)
+    # ================================================================
+
+    def publish_structure(self, player, structure_id: str) -> bool:
+        """公开自己的建筑"""
+        if not self._check_normal_permission(player, "allow_public_share"):
+            player.send_message("§c[MXCR] 你没有公开建筑的权限!")
+            return False
+        meta = self._store.get_owned_structure(
+            str(player.unique_id), player.name, structure_id)
+        if meta is None:
+            player.send_message("§c[MXCR] 建筑不存在!")
+            return False
+        return self._store.set_public(structure_id, True)
+
+    def unpublish_structure(self, structure_id: str) -> bool:
+        """管理员取消公开"""
+        return self._store.set_public(structure_id, False)
+
+    def admin_publish_structure(self, player, structure_id: str) -> bool:
+        """管理员公开任意建筑"""
+        if not self._perm_mgr.is_game_admin(player.name, player.is_op):
+            return False
+        return self._store.set_public(structure_id, True)
+
+    def import_structure_to_me(self, player, structure_id: str) -> bool:
+        """管理员将建筑转入自己名下（文件不动，键名不变）"""
+        if not self._perm_mgr.is_game_admin(player.name, player.is_op):
+            return False
+        return self._store.transfer_ownership(
+            structure_id, str(player.unique_id), player.name)
+
+    # ================================================================
+    #  撤销 / 重做 (快照式)
+    # ================================================================
+
+    def undo_operation(self, player):
+        """撤销上一步操作"""
+        player_name = player.name
+        if not self._check_normal_permission(player, "allow_undo_redo"):
+            player.send_message("§c[MXCR] 你没有撤销权限!")
+            return
+        if not self._require_backend(player):
+            return
+
+        entry = self._store.pop_undo_entry("undo", player_name)
+        if entry is None:
+            player.send_message("§e[MXCR] 没有可撤销的操作")
+            return
+
+        player.send_message(f"§e[MXCR] 正在撤销: {entry.description}...")
+        self._restore_entry(player, entry, push_to="redo", redo_of=False)
+
+    def redo_operation(self, player):
+        """重做被撤销的操作"""
+        player_name = player.name
+        if not self._check_normal_permission(player, "allow_undo_redo"):
+            player.send_message("§c[MXCR] 你没有重做权限!")
+            return
+        if not self._require_backend(player):
+            return
+
+        entry = self._store.pop_undo_entry("redo", player_name)
+        if entry is None:
+            player.send_message("§e[MXCR] 没有可重做的操作")
+            return
+
+        player.send_message(f"§a[MXCR] 正在重做: {entry.description}...")
+        self._restore_entry(player, entry, push_to="undo", redo_of=True)
+
+    def _restore_entry(self, player, entry: UndoEntry, push_to: str, redo_of: bool):
+        """
+        通用恢复流程（撤销与重做对称）：
+        1. 引擎导出区域当前状态 -> 反向条目压入对侧栈
+        2. 引擎放置 entry.restore_key 回区域
+        放置失败时把条目压回原栈，避免记录丢失。
+        """
+        player_name = player.name
+        dim_name = entry.dimension
+        bounds = entry.bounds
+        min_pos = (bounds[0], bounds[1], bounds[2])
+        max_pos = (bounds[3], bounds[4], bounds[5])
+
+        from endstone.boss import BarColor
+        color = BarColor.GREEN if redo_of else BarColor.YELLOW
+        self._progress_mgr.show_progress(
+            player, f"§{'a' if redo_of else 'e'}{entry.description}...", 0.1, color
+        )
+
+        # 快照键提前生成：即使导出失败也复用同一键名逻辑
+        inverse_key = new_snapshot_key()
+
+        def after_snapshot(stage: int, message: str):
+            p = self.server.get_player(player_name)
+            try:
+                if p is None:
+                    self._progress_mgr.hide_progress_by_name(player_name)
+                    return
+
+                snap_ok = stage == STAGE_OK
+                if not snap_ok:
+                    p.send_message("§e[MXCR] 区域快照失败，反向操作将不可用!")
+                    self.logger.warning(f"[MXCR] undo snapshot failed: {message}")
+
+                self._progress_mgr.update_progress(p, 0.5, "§a正在恢复区域...")
+
+                def after_place(pstage: int, pmessage: str):
+                    p2 = self.server.get_player(player_name)
+                    try:
+                        if p2 is None:
+                            self._progress_mgr.hide_progress_by_name(player_name)
+                            return
+                        if pstage != STAGE_OK:
+                            # 放置失败：条目压回原栈
+                            origin_stack = "undo" if push_to == "redo" else "redo"
+                            self._store.push_undo_entry(origin_stack, player_name, entry)
+                            self._progress_mgr.hide_progress(p2)
+                            p2.send_message(
+                                f"§c[MXCR] 恢复失败: {self._backend.stage_message(pstage)}")
+                            p2.send_message("§7记录已保留，可稍后重试")
+                            return
+                        if snap_ok:
+                            inverse = UndoEntry(
+                                restore_key=inverse_key, bounds=bounds,
+                                dimension=dim_name,
+                                description=("重做:" if push_to == "undo" else "撤销:")
+                                            + entry.description,
+                            )
+                            self._store.push_undo_entry(push_to, player_name, inverse)
+                        self._finish_progress(player_name, 1.0, "§a操作完成!")
+                        p2.send_message("§a[MXCR] §l操作完成!")
+                    except Exception as e:
+                        self.logger.error(f"Failed to finish restore: {e}")
+                        self._progress_mgr.hide_progress_by_name(player_name)
+
+                job = self._backend.place_structure(
+                    entry.restore_key, min_pos, dim_name,
+                    tp_player=player_name, on_done=after_place,
+                )
+                if job == 0:
+                    origin_stack = "undo" if push_to == "redo" else "redo"
+                    self._store.push_undo_entry(origin_stack, player_name, entry)
+                    self._progress_mgr.hide_progress(p)
+                    p.send_message("§c[MXCR] 恢复请求被拒绝，记录已保留!")
+            except Exception as e:
+                self.logger.error(f"Failed to restore: {e}")
+                self._progress_mgr.hide_progress_by_name(player_name)
+
+        job = self._backend.export_region(
+            inverse_key, min_pos, max_pos, dim_name,
+            tp_player=player_name, on_done=after_snapshot,
+        )
+        if job == 0:
+            # 快照被拒：仍尝试恢复（反向条目缺失）
+            p = self.server.get_player(player_name)
+            if p is not None:
+                p.send_message("§e[MXCR] 区域快照请求被拒，本次操作将不可回退!")
+            after_snapshot(-1, "export request rejected")
+
+    # ================================================================
+    #  刷新区块
+    # ================================================================
 
     def refresh_chunks_for_player(self, player):
         """刷新区块 - 通过传送玩家到远处再传送回来实现"""
@@ -1517,321 +1328,64 @@ class MXCRPlugin(Plugin):
         except Exception as e:
             player.send_message(f"§c[MXCR] 刷新区块失败: {str(e)}")
 
-    # ========== 撤销/重做操作 ==========
+    # ================================================================
+    #  预览面板切换
+    # ================================================================
 
-    def undo_operation(self, player, reliable_mode: bool = False):
-        """撤销上一步操作（使用分块加载）"""
+    def toggle_preview_panel(self, player):
+        """切换预览面板显示/隐藏"""
         player_name = player.name
 
-        # v1.0.0: 权限校验放在方法内部，命令与表单两条路径统一拦截
-        if not self._check_normal_permission(player, "allow_undo_redo"):
-            player.send_message("§c[MXCR] 你没有撤销权限!")
+        # 检查是否在预览状态
+        if player_name not in self.preview_manager.active_previews:
+            player.send_message("§e[MXCR] 当前没有进行预览")
             return
 
-        if not self._undo_mgr.can_undo(player_name):
-            player.send_message("§e[MXCR] 没有可撤销的操作")
-            return
-
-        action = self._undo_mgr.pop_undo_action(player_name)
-        if action is None:
-            player.send_message("§e[MXCR] 没有可撤销的操作")
-            return
-
-        try:
-            player.send_message(f"§e[MXCR] 正在撤销操作: {action.description}...")
-
-            from endstone.boss import BarColor as _BarColor
-            self._progress_mgr.show_progress(
-                player, f"§e正在撤销: {action.description}...",
-                0.0, _BarColor.YELLOW
-            )
-
-            # 先异步读取当前容器物品数据，再推入重做栈并执行恢复
-            self._snapshot_and_restore(
-                player=player,
-                action_to_restore=action,
-                push_to="redo",
-                description=f"撤销: {action.description}",
-                bar_color=_BarColor.YELLOW,
-                reliable_mode=reliable_mode,
-            )
-
-        except Exception as e:
-            # v1.0.0: 撤销启动失败时把 action 放回栈，避免记录丢失
-            try:
-                self._undo_mgr.push_undo_action(player_name, action)
-            except Exception:
-                pass
-            player.send_message(f"§c[MXCR] 撤销失败: {str(e)}")
-            self.logger.error(f"Undo operation failed: {e}")
-
-    def redo_operation(self, player, reliable_mode: bool = False):
-        """重做撤销的操作（使用分块加载）"""
-        player_name = player.name
-
-        # v1.0.0: 权限校验放在方法内部，命令与表单两条路径统一拦截
-        if not self._check_normal_permission(player, "allow_undo_redo"):
-            player.send_message("§c[MXCR] 你没有重做权限!")
-            return
-
-        if not self._undo_mgr.can_redo(player_name):
-            player.send_message("§e[MXCR] 没有可重做的操作")
-            return
-
-        action = self._undo_mgr.pop_redo_action(player_name)
-        if action is None:
-            player.send_message("§e[MXCR] 没有可重做的操作")
-            return
-
-        try:
-            player.send_message(f"§e[MXCR] 正在重做操作: {action.description}...")
-
-            from endstone.boss import BarColor as _BarColor
-            self._progress_mgr.show_progress(
-                player, f"§a正在重做: {action.description}...",
-                0.0, _BarColor.GREEN
-            )
-
-            # 先异步读取当前容器物品数据，再推入撤销栈并执行恢复
-            self._snapshot_and_restore(
-                player=player,
-                action_to_restore=action,
-                push_to="undo",
-                description=f"重做: {action.description}",
-                bar_color=_BarColor.GREEN,
-                reliable_mode=reliable_mode,
-            )
-
-        except Exception as e:
-            # v1.0.0: 重做启动失败时把 action 放回栈，避免记录丢失
-            try:
-                self._undo_mgr.push_redo_action(player_name, action)
-            except Exception:
-                pass
-            player.send_message(f"§c[MXCR] 重做失败: {str(e)}")
-            self.logger.error(f"Redo operation failed: {e}")
-
-    def _snapshot_and_restore(
-        self, player, action_to_restore, push_to: str,
-        description: str, bar_color, reliable_mode: bool
-    ):
-        """
-        通用撤销/重做核心流程：
-        1. 扫描当前世界中需要快照的方块（方块类型 + 容器物品）
-        2. 扫描当前区域内的实体（Endstone 侧基础属性）
-        3. 异步读取容器物品数据
-        4. 异步读取实体 SAPI 扩展数据（颜色/装备/药水/属性）
-        5. 全部读取完毕后，将快照推入对应栈，再执行方块恢复
-
-        Args:
-            player: 玩家对象
-            action_to_restore: 要恢复的 UndoAction
-            push_to: "redo" 或 "undo"，决定快照推入哪个栈
-            description: 操作描述（用于 ChunkLoader 进度条）
-            bar_color: 进度条颜色
-            reliable_mode: 是否使用传统可靠模式
-        """
-        player_name = player.name
-        dimension = player.dimension
-        dim_name = action_to_restore.dimension
-
-        # ---- 第一步：扫描当前方块状态（v1.0.0: 按区块分批读取 + 磁盘 writer 流式写入）----
-        snapshot_writer = self._undo_mgr.open_action_writer(
-            player_name, action_to_restore.action_type, dim_name,
-            action_to_restore.description
-        )
-        # 需要异步读取容器物品的快照记录（数量少，暂留内存，读完后再写入 writer）
-        container_snapshot_records = []
-
-        try:
-            for chunk_key in action_to_restore.get_chunk_list():
-                chunk_records = action_to_restore.get_chunk_blocks(chunk_key[0], chunk_key[1])
-                for block_record in chunk_records:
-                    try:
-                        block = dimension.get_block_at(
-                            block_record.x, block_record.y, block_record.z
-                        )
-                        bd = block.data
-                        states = dict(bd.block_states) if bd.block_states else {}
-                        cur_type = str(block.type)
-                        rec = BlockRecord(
-                            x=block_record.x,
-                            y=block_record.y,
-                            z=block_record.z,
-                            block_type=cur_type,
-                            block_data=0,
-                            block_states=states,
-                            nbt_data=None,
-                        )
-                        # 如果当前方块是容器，标记需要读取物品（暂留内存）
-                        if self._container_mgr.is_container_block(cur_type):
-                            container_snapshot_records.append(rec)
-                        else:
-                            snapshot_writer.add_block(rec)
-                    except Exception:
-                        pass
-                chunk_records.clear()
-        except Exception as e:
-            self.logger.warning(f"[MXCR] 快照扫描异常: {e}")
-
-        # ---- 第一步①：扫描当前区域内的实体（快照，Endstone 侧基础属性）----
-        snapshot_entities = []
-        snap_min_pos, snap_max_pos = action_to_restore.get_bounds()
-        if action_to_restore.block_count > 0:
-            try:
-                snapshot_entities = self._entity_mgr.scan_entities_in_selection(
-                    dimension, snap_min_pos, snap_max_pos
-                )
-            except Exception as e:
-                self.logger.warning(f"[MXCR] 实体快照扫描失败: {e}")
-
-        def _push_snapshot_and_restore():
-            """快照容器物品和实体 SAPI 数据读取完毕后，推入栈并执行恢复"""
-            # 把读完物品的容器快照补写入 writer，然后提交生成快照 action
-            snapshot_action = None
-            try:
-                for rec in container_snapshot_records:
-                    snapshot_writer.add_block(rec)
-                container_snapshot_records.clear()
-                snapshot_writer.set_entities(snapshot_entities)
-                snapshot_action = snapshot_writer.commit_detached()
-            except Exception as e:
-                self.logger.warning(f"[MXCR] 快照提交失败: {e}")
-
-            if snapshot_action is not None:
-                if push_to == "redo":
-                    self._undo_mgr.push_redo_action(snapshot_action)
-                else:
-                    self._undo_mgr.push_undo_action(snapshot_action)
-
-            # 先删除当前区域内的实体（即快照时扫描到的实体）
-            # snapshot_entities 中的坐标是相对于 snap_min_pos 的偏移，需加上 snap_min_pos 得到绝对坐标
-            try:
-                dim_obj = self.server.level.get_dimension(dim_name)
-                for ent_info in snapshot_entities:
-                    try:
-                        abs_x = ent_info.rel_x + snap_min_pos[0]
-                        abs_y = ent_info.rel_y + snap_min_pos[1]
-                        abs_z = ent_info.rel_z + snap_min_pos[2]
-                        for actor in dim_obj.actors:
-                            try:
-                                if (abs(actor.location.x - abs_x) < 0.5 and
-                                        abs(actor.location.y - abs_y) < 0.5 and
-                                        abs(actor.location.z - abs_z) < 0.5 and
-                                        actor.type == ent_info.type_id):
-                                    actor.remove()
-                                    break
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            # 执行方块恢复（v1.0.0: 传 undo_action 流式读取，不再全量载入内存）
-            self._chunk_loader.restore_blocks_with_chunk_loading(
-                player, None, dim_name, description, reliable_mode,
-                entities_to_restore=action_to_restore.entities,
-                undo_action=action_to_restore,
-            )
-
-        # ---- 第三步：异步读取容器物品 + 实体 SAPI 数据，全部完成后执行恢复 ----
-        # 使用统一的 pending 计数器跟踪所有异步任务
-        has_containers = bool(container_snapshot_records)
-        has_entities = bool(snapshot_entities)
-
-        # 如果无容器且无实体，直接执行
-        if not has_containers and not has_entities:
-            _push_snapshot_and_restore()
-            return
-
-        # 异步任务数：容器读取 + 实体 SAPI 读取（各算 1 个大任务）
-        async_tasks_remaining = [0]
-        if has_containers:
-            async_tasks_remaining[0] += 1
-        if has_entities:
-            async_tasks_remaining[0] += 1
-
-        def _on_async_task_done():
-            """每个异步大任务完成后调用，全部完成后执行恢复"""
-            async_tasks_remaining[0] -= 1
-            if async_tasks_remaining[0] <= 0:
-                _push_snapshot_and_restore()
-
-        # ---- 异步任务 A：读取容器物品（v1.0.0: 分批节流）----
-        if has_containers:
-            records_list = list(container_snapshot_records)
-            read_batch_size = 16
-
-            def read_snap_batch(start_idx):
-                if start_idx >= len(records_list):
-                    _on_async_task_done()
-                    return
-                batch = records_list[start_idx:start_idx + read_batch_size]
-                batch_pending = [len(batch)]
-
-                def make_snapshot_cb(rec):
-                    def cb(slots, error):
-                        if not error and slots:
-                            rec.nbt_data = json.dumps(slots, ensure_ascii=False)
-                        batch_pending[0] -= 1
-                        if batch_pending[0] <= 0:
-                            self.server.scheduler.run_task(
-                                self,
-                                lambda: read_snap_batch(start_idx + read_batch_size),
-                                delay=1
-                            )
-                    return cb
-
-                for rec in batch:
-                    self._container_mgr.request_read(
-                        x=rec.x, y=rec.y, z=rec.z,
-                        dim_name=dim_name,
-                        callback=make_snapshot_cb(rec),
-                    )
-
-            read_snap_batch(0)
-
-        # ---- 异步任务 B：读取实体 SAPI 扩展数据（颜色/装备/药水/属性）----
-        if has_entities:
-            def on_sapi_entities(entities_list, error):
-                """实体 SAPI 数据读取回调（通过位置匹配）"""
-                if error:
-                    self.logger.warning(
-                        f"[MXCR] 撤销/重做实体 SAPI 数据读取失败: {error}，将仅保存 Endstone 侧数据"
-                    )
-                elif entities_list:
-                    # 通过位置匹配将 SAPI 数据填充到对应的 EntityInfo
-                    for sapi_ent in entities_list:
-                        sx = sapi_ent.get("loc_x", 0)
-                        sy = sapi_ent.get("loc_y", 0)
-                        sz = sapi_ent.get("loc_z", 0)
-                        best_ei = None
-                        best_dist = 1.0  # 最大匹配距离（格）
-                        for ei in snapshot_entities:
-                            # EntityInfo 中存的是相对坐标，加上 snap_min_pos 得绝对坐标
-                            ex = ei.rel_x + snap_min_pos[0]
-                            ey = ei.rel_y + snap_min_pos[1]
-                            ez = ei.rel_z + snap_min_pos[2]
-                            dist = ((ex - sx) ** 2 + (ey - sy) ** 2 + (ez - sz) ** 2) ** 0.5
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_ei = ei
-                        if best_ei is not None:
-                            best_ei.sapi_data = sapi_ent
-
-                _on_async_task_done()
-
-            self._entity_mgr.request_read_sapi_data(
-                dim_name=dim_name,
-                min_pos=snap_min_pos,
-                max_pos=snap_max_pos,
-                callback=on_sapi_entities,
-            )
+        # 显示预览面板
+        self.preview_manager._show_adjustment_panel(player)
+        player.send_message("§a[MXCR] 预览面板已打开")
 
     # ================================================================
-    #  事件处理: 玩家退出（合并所有清理逻辑）
+    #  后端状态 (/mxcr bridge)
     # ================================================================
+
+    def _check_bridge_status(self, player):
+        """报告 StructBridge 后端连接状态（v1.1.0: 替代原 SAPI 桥接检测）"""
+        ok, msg = self._backend.ensure()
+        if not ok:
+            player.send_message("§c[MXCR 后端] StructBridge 不可用!")
+            player.send_message("§c请确认:")
+            player.send_message("§f  1. StructBridge 插件 (endstone_structbridge.dll/.so) 已放入 plugins/")
+            player.send_message("§f  2. StructBridge 为最新版 (v0.0.3+，Windows 需含 Python API)")
+            player.send_message(f"§f  3. 详细错误: {self._backend.load_error or msg}")
+            return
+
+        status = self._backend.status()
+        count = status.get("structures", "?")
+        player.send_message("§a[MXCR 后端] §lStructBridge 连接正常!")
+        player.send_message(f"§f  版本: §e{self._backend.version}")
+        player.send_message(f"§f  引擎可见结构数: §e{count}")
+        player.send_message("§7保存/加载/撤销功能已就绪 (引擎原生序列化，含容器物品与实体)")
+
+    # ================================================================
+    #  进度条收尾辅助
+    # ================================================================
+
+    def _finish_progress(self, player_name: str, progress: float, text: str):
+        """更新进度到完成态并延迟隐藏"""
+        p = self.server.get_player(player_name)
+        if p is not None:
+            self._progress_mgr.update_progress(p, progress, text)
+
+        def hide_bar():
+            self._progress_mgr.hide_progress_by_name(player_name)
+
+        self.server.scheduler.run_task(self, hide_bar, delay=30)
+
+    # ================================================================
+    #  事件处理: 玩家退出
+    # ================================================================
+
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent):
         """
@@ -1861,76 +1415,3 @@ class MXCRPlugin(Plugin):
                 self._progress_mgr.hide_progress(player)
         except Exception:
             pass
-
-    # ================================================================
-    #  容器管理器定时任务
-    # ================================================================
-
-    def _container_tick(self):
-        """每 tick 调用，用于超时清理挂起的容器请求和实体请求"""
-        try:
-            self._container_mgr.tick()
-        except Exception:
-            pass
-        try:
-            self._entity_mgr.tick()
-        except Exception:
-            pass
-
-    # ================================================================
-    #  事件处理: ScriptMessageEvent（来自 SAPI 的回传）
-    # ================================================================
-
-    @event_handler
-    def on_script_message(self, event: ScriptMessageEvent):
-        """处理来自 SAPI Behavior Pack 的 scriptevent 回传"""
-        try:
-            # 先尝试实体管理器处理（返回 True 表示已处理）
-            handled = self._entity_mgr.on_script_message(event.message_id, event.message)
-            if not handled:
-                # 实体管理器不认识此消息，转由到容器管理器
-                self._container_mgr.on_script_message(event.message_id, event.message)
-        except Exception as e:
-            self.logger.warning(f"[MXCR] ScriptMessageEvent 处理异常: {e}")
-
-    def _check_bridge_connection(self, player):
-        """
-        检测 SAPI Bridge Behavior Pack 是否已连接。
-        通过发送一个 ping scriptevent，等待 SAPI 回传 pong 来确认连接状态。
-        """
-        player_name = player.name
-
-        player.send_message("\u00a7e[MXCR Bridge] \u6b63\u5728\u68c0\u6d4b SAPI \u8fde\u63a5\u72b6\u6001...")
-
-        def on_pong(slots, error):
-            p = self.server.get_player(player_name)
-            if p is None:
-                return
-            if error and "\u8bf7\u6c42\u8d85\u65f6" in error:
-                p.send_message("\u00a7c[MXCR Bridge] \u672a\u68c0\u6d4b\u5230 SAPI Bridge Behavior Pack")
-                p.send_message("\u00a7c\u8bf7\u786e\u8ba4\uff1a")
-                p.send_message("\u00a7f  1. Behavior Pack \u5df2\u5b89\u88c5\u5e76\u5e94\u7528\u5230\u5f53\u524d\u4e16\u754c")
-                p.send_message("\u00a7f  2. \u4e16\u754c\u5df2\u5f00\u542f Beta API \u5b9e\u9a8c\u6027\u529f\u80fd")
-                p.send_message("\u00a7f  3. @minecraft/server \u7248\u672c\u4e3a 2.5.0")
-                p.send_message("\u00a7f  4. \u670d\u52a1\u5668\u542f\u52a8\u65f6\u804a\u5929\u680f\u5e94\u663e\u793a [MXCR Bridge] \u5df2\u52a0\u8f7d")
-            elif error:
-                p.send_message(f"\u00a7c[MXCR Bridge] \u8fde\u63a5\u5f02\u5e38: {error}")
-            else:
-                p.send_message("\u00a7a[MXCR Bridge] \u2714 SAPI Bridge \u8fde\u63a5\u6b63\u5e38!")
-                p.send_message("\u00a7f  \u5bb9\u5668\u7269\u54c1\u4fdd\u5b58/\u8fd8\u539f\u529f\u80fd\u5df2\u5c31\u7eea")
-
-        # v1.0.0: 使用 ContainerManager 公共 request_ping 接口（不再直接操作私有成员）
-        self._container_mgr.request_ping(on_pong, timeout_ticks=60)
-
-    def toggle_preview_panel(self, player):
-        """切换预览面板显示/隐藏"""
-        player_name = player.name
-        
-        # 检查是否在预览状态
-        if player_name not in self.preview_manager.active_previews:
-            player.send_message("§e[MXCR] 当前没有进行预览")
-            return
-        
-        # 显示预览面板
-        self.preview_manager._show_adjustment_panel(player)
-        player.send_message("§a[MXCR] 预览面板已打开")

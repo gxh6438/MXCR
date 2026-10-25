@@ -7,22 +7,25 @@ from typing import List, Dict, Any
 
 
 # ========== 默认配置 ==========
+# v1.1.0: 移除 preserve_air / excluded_blocks / batch_size / chunk_wait_timeout_seconds
+# （引擎原生 .mcstructure 序列化不支持方块过滤；区块加载由 StructBridge 处理）
 DEFAULT_CONFIG = {
     "plugin_enabled": True,  # 插件总开关
     "max_block_count": 100000,
     "particle_id": "minecraft:endrod",
-    "preserve_air": True,
-    "excluded_blocks": [],
     "authorized_save_limit": 20,
     "menu_item_enabled": False,
     "menu_item_id": "minecraft:compass",
-    "batch_size": 1000,
     "foot_block_id": "minecraft:oak_planks",
     "selection_item_id": "minecraft:wooden_axe",
     "modify_item_id": "minecraft:stick",
     "normal_player_permissions_enabled": False,
-    "chunk_wait_timeout_seconds": 60
 }
+
+# v1.0.x 遗留键，加载时从配置文件中清除
+_DEPRECATED_KEYS = (
+    "preserve_air", "excluded_blocks", "batch_size", "chunk_wait_timeout_seconds",
+)
 
 DEFAULT_PERMISSIONS = {
     "authorized_players": [],
@@ -51,6 +54,11 @@ class ConfigManager:
         for key, val in DEFAULT_CONFIG.items():
             if key not in self.config:
                 self.config[key] = val
+
+        # 清理 v1.0.x 遗留键
+        stale = [k for k in _DEPRECATED_KEYS if k in self.config]
+        for k in stale:
+            del self.config[k]
 
         self._save()
 
@@ -97,14 +105,6 @@ class ConfigManager:
         return self.config.get("particle_id", "minecraft:endrod")
 
     @property
-    def preserve_air(self) -> bool:
-        return self.config.get("preserve_air", True)
-
-    @property
-    def excluded_blocks(self) -> List[str]:
-        return self.config.get("excluded_blocks", [])
-
-    @property
     def authorized_save_limit(self) -> int:
         return self.config.get("authorized_save_limit", 20)
 
@@ -131,15 +131,6 @@ class ConfigManager:
     @property
     def normal_player_permissions_enabled(self) -> bool:
         return self.config.get("normal_player_permissions_enabled", False)
-
-    @property
-    def chunk_wait_timeout_seconds(self) -> int:
-        val = self.config.get("chunk_wait_timeout_seconds", 60)
-        # 限制范围：最小 10 秒，最大 300 秒
-        try:
-            return max(10, min(300, int(val)))
-        except (TypeError, ValueError):
-            return 60
 
 
 class PermissionManager:

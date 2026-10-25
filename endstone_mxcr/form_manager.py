@@ -1,6 +1,11 @@
 """
-表单管理模块 - 所有 UI 表单
+表单管理模块 - 所有 UI 表单 (v1.1.0)
 使用 Minecraft 颜色代码 § 美化文字
+
+底层迁移到 StructBridge 后：
+- 移除模式选择表单（快速/传统可靠）、方块过滤、保留空气/水/岩浆等控件
+- 数据访问走 plugin.store（单文件元数据 SQLite）
+- 保存/加载直接调用插件新签名，引擎原生处理区块加载与容器/实体保真
 
 确认的 API:
 - from endstone.form import ActionForm, ModalForm, MessageForm, TextInput, Toggle, Dropdown, Label
@@ -15,6 +20,7 @@
 - Label(text)
 """
 import json
+import math
 import time
 
 from endstone.form import (
@@ -59,22 +65,6 @@ class FormManager:
     # ================================================================
     #  主菜单
     # ================================================================
-    def _show_mode_select_form(self, player, title: str, callback):
-        """显示区块模式选择表单（快速实验 / 传统可靠）"""
-        from endstone.form import MessageForm
-        form = MessageForm(
-            title=_b(title, C_GOLD),
-            content=(
-                f"{C_YELLOW}请选择区块处理模式:\n\n"
-                f"{_b('快速实验', C_GREEN)}: 已加载区块直接处理，未加载区块逐个 TP（默认）\n"
-                f"{_b('传统可靠', C_RED)}: 全部区块逐个 TP，防止漏区块，速度较慢"
-            ),
-            button1=_b("快速实验", C_GREEN),
-            button2=_b("传统可靠", C_RED),
-            on_submit=lambda p, idx: callback(p, idx == 1)
-        )
-        player.send_form(form)
-
     def show_main_menu(self, player):
         """显示主菜单"""
         p_name = player.name
@@ -83,8 +73,7 @@ class FormManager:
         cfg = self.plugin.config_manager
         is_admin = perm_mgr.is_game_admin(p_name, is_op)
         is_authorized = perm_mgr.is_authorized(p_name, is_op)
-        # v1.0.0: 统一使用插件的权限检查辅助方法（消除此处重复的 UUID 判断逻辑），
-        # 并按权限键决定按钮可见性，与后端实际执行的权限校验保持一致
+        # 统一使用插件的权限检查辅助方法，并按权限键决定按钮可见性
         has_copy = self.plugin._check_normal_permission(player, "allow_copy")
         has_foot_block = self.plugin._check_normal_permission(player, "allow_foot_block")
         has_undo_redo = self.plugin._check_normal_permission(player, "allow_undo_redo")
@@ -104,7 +93,7 @@ class FormManager:
             )
         )
 
-        # 如果玩家处于预览模式，在第一位插入“预览面板”按钮
+        # 如果玩家处于预览模式，在第一位插入"预览面板"按钮
         if is_in_preview:
             form.add_button(
                 _b("预览面板", C_LIGHT_PURPLE),
@@ -129,23 +118,17 @@ class FormManager:
                 icon="textures/ui/icon_book_writable",
                 on_click=lambda p: self.show_my_structures(p)
             )
-            # v1.0.0: 撤销/恢复按钮按 allow_undo_redo 权限显示
+            # 撤销/恢复按钮按 allow_undo_redo 权限显示
             if has_undo_redo:
                 form.add_button(
                     _b("撤销操作", C_YELLOW),
                     icon="textures/ui/hammer_l",
-                    on_click=lambda p: self._show_mode_select_form(
-                        p, "撤销操作",
-                        lambda _p, reliable: self.plugin.undo_operation(_p, reliable_mode=reliable)
-                    )
+                    on_click=lambda p: self.plugin.undo_operation(p)
                 )
                 form.add_button(
                     _b("恢复操作", C_GREEN),
                     icon="textures/ui/hammer_r",
-                    on_click=lambda p: self._show_mode_select_form(
-                        p, "恢复操作",
-                        lambda _p, reliable: self.plugin.redo_operation(_p, reliable_mode=reliable)
-                    )
+                    on_click=lambda p: self.plugin.redo_operation(p)
                 )
             if has_foot_block:
                 form.add_button(
@@ -159,7 +142,7 @@ class FormManager:
                 on_click=lambda p: self.plugin.stop_selection_for_player(p)
             )
 
-        # v1.0.0: 公开建筑/刷新区块按钮按对应权限键显示（授权玩家始终可见）
+        # 公开建筑/刷新区块按钮按对应权限键显示（授权玩家始终可见）
         if has_public_view:
             form.add_button(
                 _b("公开建筑", C_YELLOW),
@@ -223,11 +206,9 @@ class FormManager:
     def _on_place_foot_block(self, player):
         """在玩家脚下放置方块"""
         try:
-            # v1.0.0: 统一走插件的权限检查辅助方法
             if not self.plugin._check_normal_permission(player, "allow_foot_block"):
                 player.send_message(f"{C_RED}[权限不足] 您没有脚下方块放置权限")
                 return
-            import math
             block_id = self.plugin.config_manager.foot_block_id
             loc = player.location
             # 脚下位置 = 玩家Y坐标减1
@@ -257,9 +238,7 @@ class FormManager:
         size = selection.get_size()
         volume = selection.get_volume()
 
-        cfg = self.plugin.config_manager
-
-        # v1.0.0: 统一走插件的权限检查辅助方法判断搬迁模式权限
+        # 统一走插件的权限检查辅助方法判断搬迁模式权限
         has_move_mode = self.plugin._check_normal_permission(player, "allow_move_mode")
 
         controls = [
@@ -275,23 +254,6 @@ class FormManager:
                 placeholder="请输入建筑名称",
                 default_value=""
             ),
-            TextInput(
-                f"{_b('排除方块', C_YELLOW)} (用逗号分隔)",
-                placeholder="例: minecraft:dirt,minecraft:stone",
-                default_value=""
-            ),
-            Toggle(
-                f"{_b('保留空气方块', C_AQUA)}",
-                default_value=cfg.preserve_air
-            ),
-            Toggle(
-                f"{_b('保留水', C_BLUE)}",
-                default_value=True
-            ),
-            Toggle(
-                f"{_b('保留岩浆', C_RED)}",
-                default_value=True
-            ),
         ]
 
         if has_move_mode:
@@ -299,11 +261,6 @@ class FormManager:
                 f"{_b('搬迁模式', C_RED)} (保存后删除原方块)",
                 default_value=False
             ))
-
-        controls.append(Toggle(
-            f"{_b('传统可靠模式', C_RED)} {C_WHITE}(全部区块逐个 TP，防漏区块，速度较慢)",
-            default_value=False
-        ))
 
         form = ModalForm(
             title=_b("保存建筑", C_GOLD),
@@ -318,31 +275,19 @@ class FormManager:
         """保存建筑提交回调"""
         try:
             data = json.loads(data_str)
-            # Label 在 JSON 数据中会产生一个 null 値,所以:
-            # data[0] = null (Label 产生的空値)
+            # Label 在 JSON 数据中会产生一个 null 值,所以:
+            # data[0] = null (Label 产生的空值)
             # data[1] = 建筑名称 (TextInput)
-            # data[2] = 排除方块 (TextInput)
-            # data[3] = 保留空气 (Toggle)
-            # data[4] = 保留水 (Toggle)
-            # data[5] = 保留岩浆 (Toggle)
             # 有搬迁模式权限时:
-            #   data[6] = 搬迁模式 (Toggle)
-            #   data[7] = 传统可靠模式 (Toggle)
-            # 无搬迁模式权限时:
-            #   data[6] = 传统可靠模式 (Toggle)
+            #   data[2] = 搬迁模式 (Toggle)
+            # 无搬迁模式权限时: 无后续控件
 
-            if isinstance(data, list) and len(data) >= 6:
+            if isinstance(data, list) and len(data) >= 2:
                 name = str(data[1]).strip() if data[1] else ""
-                excluded_blocks_str = str(data[2]).strip() if data[2] else ""
-                preserve_air = bool(data[3])
-                preserve_water = bool(data[4])
-                preserve_lava = bool(data[5])
                 if has_move_mode:
-                    relocate = bool(data[6]) if len(data) > 6 and data[6] is not None else False
-                    reliable_mode = bool(data[7]) if len(data) > 7 and data[7] is not None else False
+                    relocate = bool(data[2]) if len(data) > 2 and data[2] is not None else False
                 else:
                     relocate = False  # 无权限，强制关闭搬迁模式
-                    reliable_mode = bool(data[6]) if len(data) > 6 and data[6] is not None else False
             else:
                 player.send_message(f"{C_RED}表单数据格式错误!")
                 return
@@ -351,15 +296,7 @@ class FormManager:
                 player.send_message(f"{C_RED}建筑名称不能为空!")
                 return
 
-            # 解析排除方块列表
-            excluded_blocks = []
-            if excluded_blocks_str:
-                excluded_blocks = [b.strip() for b in excluded_blocks_str.split(",") if b.strip()]
-
-            self.plugin.save_structure_for_player(
-                player, name, preserve_air, relocate, excluded_blocks, preserve_water, preserve_lava,
-                reliable_mode=reliable_mode
-            )
+            self.plugin.save_structure_for_player(player, name, relocate)
 
         except Exception as e:
             player.send_message(f"{C_RED}保存失败: {str(e)}")
@@ -370,9 +307,8 @@ class FormManager:
     def show_my_structures(self, player):
         """显示我的建筑列表"""
         p_uuid = str(player.unique_id)
-        p_name = player.name
 
-        structures = self.plugin.db_manager.get_structures(p_uuid, p_name)
+        structures = self.plugin.store.list_owned_structures(p_uuid)
 
         if not structures:
             form = MessageForm(
@@ -416,7 +352,7 @@ class FormManager:
         """显示建筑详情"""
         p_uuid = str(player.unique_id)
         p_name = player.name
-        meta = self.plugin.db_manager.get_structure_metadata(p_uuid, structure_id, p_name)
+        meta = self.plugin.store.get_owned_structure(p_uuid, structure_id, p_name)
 
         if meta is None:
             player.send_message(f"{C_RED}建筑不存在!")
@@ -431,7 +367,8 @@ class FormManager:
             content=(
                 f"{C_AQUA}建筑ID: {C_WHITE}{meta.structure_id}\n"
                 f"{C_AQUA}尺寸: {C_WHITE}{size[0]} x {size[1]} x {size[2]}\n"
-                f"{C_AQUA}方块数: {C_WHITE}{meta.block_count}\n"
+                f"{C_AQUA}区域体积: {C_WHITE}{meta.get_volume()} 方块"
+                + (f"\n{C_LIGHT_PURPLE}(大区域结构束)" if meta.is_bundle else "") + "\n"
                 f"{C_AQUA}坐标: {C_WHITE}({meta.min_x},{meta.min_y},{meta.min_z}) ~ ({meta.max_x},{meta.max_y},{meta.max_z})\n"
                 f"{C_AQUA}维度: {C_WHITE}{meta.dimension}\n"
                 f"{C_AQUA}保存时间: {C_WHITE}{ts}"
@@ -440,31 +377,27 @@ class FormManager:
 
         if is_authorized:
             sid = structure_id
-            # 原有按鈕：加载到原坐标
+            # 加载到原坐标
             form.add_button(
                 _b("加载到原坐标", C_GREEN),
                 icon="textures/ui/icon_recipe_nature",
-                on_click=lambda p, _sid=sid, _m=meta: self._show_mode_select_form(
-                    p, f"加载到原坐标: {_m.name}",
-                    lambda _p, reliable: self.plugin.load_structure_for_player(
-                        _p, _sid, (_m.min_x, _m.min_y, _m.min_z),
-                        reliable_mode=reliable
-                    )
+                on_click=lambda p, _sid=sid, _m=meta: self.plugin.load_structure_for_player(
+                    p, _sid, (_m.min_x, _m.min_y, _m.min_z)
                 )
             )
-            # 原有按钮：加载建筑（当前位置）
+            # 加载建筑（当前位置）
             form.add_button(
                 _b("加载建筑 (当前位置)", C_BLUE),
                 icon="textures/ui/icon_recipe_item",
                 on_click=lambda p, _sid=sid: self._on_load_current_position(p, _sid)
             )
-            # 原有按钮：加载到指定坐标
+            # 加载到指定坐标
             form.add_button(
                 _b("加载到指定坐标", C_AQUA),
                 icon="textures/ui/icon_setting",
                 on_click=lambda p, _sid=sid, _m=meta: self.show_load_position_form(p, _sid, _m)
             )
-            # 新增按钮：加载建筑（预览模式）
+            # 加载建筑（预览模式）
             form.add_button(
                 _b("加载建筑 (预览模式)", C_LIGHT_PURPLE),
                 icon="textures/ui/magnifyingGlass",
@@ -490,61 +423,31 @@ class FormManager:
 
         player.send_form(form)
 
-    def _on_load_original(self, player, structure_id: str, meta):
-        """加载到原坐标（先弹出模式选择）"""
-        self._show_mode_select_form(
-            player,
-            title=f"加载到原坐标: {meta.name}",
-            callback=lambda p, reliable: self.plugin.load_structure_for_player(
-                p, structure_id,
-                (meta.min_x, meta.min_y, meta.min_z),
-                reliable_mode=reliable
-            )
-        )
-
     def _on_load_current_position(self, player, structure_id: str):
-        """加载到当前位置（先弹出模式选择）"""
+        """加载到当前位置"""
         loc = player.location
-        target_pos = (int(loc.x), int(loc.y), int(loc.z))
-        self._show_mode_select_form(
-            player,
-            title="加载到当前位置",
-            callback=lambda p, reliable: self.plugin.load_structure_for_player(
-                p, structure_id, target_pos,
-                reliable_mode=reliable
-            )
-        )
+        target_pos = (math.floor(loc.x), math.floor(loc.y), math.floor(loc.z))
+        self.plugin.load_structure_for_player(player, structure_id, target_pos)
 
     def _on_load_current_position_public(self, player, structure_id: str):
-        """加载公开建筑到当前位置（先弹出模式选择）"""
+        """加载公开建筑到当前位置"""
         loc = player.location
-        target_pos = (int(loc.x), int(loc.y), int(loc.z))
-        self._show_mode_select_form(
-            player,
-            title="加载公开建筑到当前位置",
-            callback=lambda p, reliable: self.plugin.load_structure_for_player(
-                p, structure_id, target_pos,
-                source_type="public", reliable_mode=reliable
-            )
+        target_pos = (math.floor(loc.x), math.floor(loc.y), math.floor(loc.z))
+        self.plugin.load_structure_for_player(
+            player, structure_id, target_pos, source_type="public"
         )
 
-    def _on_load_current_position_admin(self, player, structure_id: str, dir_name: str):
-        """管理员加载建筑到当前位置（先弹出模式选择）"""
+    def _on_load_current_position_admin(self, player, structure_id: str):
+        """管理员加载建筑到当前位置"""
         loc = player.location
-        target_pos = (int(loc.x), int(loc.y), int(loc.z))
-        self._show_mode_select_form(
-            player,
-            title="管理员加载建筑到当前位置",
-            callback=lambda p, reliable: self.plugin.load_structure_for_player(
-                p, structure_id, target_pos,
-                source_type="admin", source_dir=dir_name, reliable_mode=reliable
-            )
+        target_pos = (math.floor(loc.x), math.floor(loc.y), math.floor(loc.z))
+        self.plugin.load_structure_for_player(
+            player, structure_id, target_pos, source_type="admin"
         )
 
     def show_load_position_form(self, player, structure_id: str, meta,
-                                 source_type: str = "player",
-                                 source_dir: str = ""):
-        """显示加载位置输入表单（含传统可靠模式 Toggle）"""
+                                 source_type: str = "player"):
+        """显示加载位置输入表单"""
         form = ModalForm(
             title=_b("选择加载坐标", C_GREEN),
             controls=[
@@ -555,13 +458,9 @@ class FormManager:
                 TextInput(f"{_b('X 坐标', C_RED)}", placeholder="X", default_value=str(meta.min_x)),
                 TextInput(f"{_b('Y 坐标', C_GREEN)}", placeholder="Y", default_value=str(meta.min_y)),
                 TextInput(f"{_b('Z 坐标', C_AQUA)}", placeholder="Z", default_value=str(meta.min_z)),
-                Toggle(
-                    f"{_b('传统可靠模式', C_RED)} {C_WHITE}(全部区块逐个 TP，防漏区块，速度较慢)",
-                    default_value=False
-                ),
             ],
             on_submit=lambda p, data: self._on_load_position_submit(
-                p, data, structure_id, source_type, source_dir
+                p, data, structure_id, source_type
             ),
             on_close=lambda p: p.send_message(f"{C_YELLOW}已取消加载")
         )
@@ -569,27 +468,22 @@ class FormManager:
 
     def _on_load_position_submit(self, player, data_str: str,
                                   structure_id: str,
-                                  source_type: str = "player",
-                                  source_dir: str = ""):
+                                  source_type: str = "player"):
         """加载到指定坐标提交"""
         try:
             data = json.loads(data_str)
-            # Label 在 JSON 数据中会产生 null 値,所以:
+            # Label 在 JSON 数据中会产生一个 null 值,所以:
             # data[0] = null (Label)
             # data[1] = X 坐标 (TextInput)
             # data[2] = Y 坐标 (TextInput)
             # data[3] = Z 坐标 (TextInput)
-            # data[4] = 传统可靠模式 (Toggle)
             x = int(data[1])
             y = int(data[2])
             z = int(data[3])
-            reliable_mode = bool(data[4]) if len(data) > 4 and data[4] is not None else False
 
             self.plugin.load_structure_for_player(
                 player, structure_id, (x, y, z),
-                source_type=source_type,
-                source_dir=source_dir,
-                reliable_mode=reliable_mode
+                source_type=source_type
             )
         except (ValueError, IndexError):
             player.send_message(f"{C_RED}坐标格式错误!请输入整数")
@@ -610,13 +504,7 @@ class FormManager:
     def _do_publish(self, player, structure_id: str, button_idx: int):
         """执行公开"""
         if button_idx == 0:
-            # v1.0.0: 公开建筑权限检查（此前 allow_public_share 从未被执行）
-            if not self.plugin._check_normal_permission(player, "allow_public_share"):
-                player.send_message(f"{C_RED}你没有公开建筑的权限!")
-                return
-            p_uuid = str(player.unique_id)
-            p_name = player.name
-            ok = self.plugin.db_manager.publish_structure(p_uuid, structure_id, p_name)
+            ok = self.plugin.publish_structure(player, structure_id)
             if ok:
                 player.send_message(f"{C_GREEN}建筑已公开!")
                 self.show_my_structures(player)  # 刷新我的建筑列表
@@ -635,7 +523,7 @@ class FormManager:
         player.send_form(form)
 
     def _do_delete(self, player, structure_id: str, button_idx: int):
-        """执行删除（v1.0.0: 走统一入口，确保 allow_delete_own 权限检查生效）"""
+        """执行删除（走统一入口，确保 allow_delete_own 权限检查生效）"""
         if button_idx == 0:
             self.plugin.delete_structure_for_player(player, structure_id)
             self.show_my_structures(player)
@@ -645,12 +533,12 @@ class FormManager:
     # ================================================================
     def show_public_structures(self, player):
         """显示公开建筑列表"""
-        # v1.0.0: 查看公开建筑权限检查（此前 allow_public_view 从未被执行）
+        # 查看公开建筑权限检查
         if not self.plugin._check_normal_permission(player, "allow_public_view"):
             player.send_message(f"{C_RED}你没有查看公开建筑的权限!")
             return
 
-        structures = self.plugin.db_manager.get_public_structures()
+        structures = self.plugin.store.list_public_structures()
 
         if not structures:
             form = MessageForm(
@@ -692,8 +580,8 @@ class FormManager:
 
     def show_public_structure_detail(self, player, structure_id: str):
         """显示公开建筑详情"""
-        meta = self.plugin.db_manager.get_public_structure_metadata(structure_id)
-        if meta is None:
+        meta = self.plugin.store.get_structure(structure_id)
+        if meta is None or not meta.is_public:
             player.send_message(f"{C_RED}建筑不存在!")
             return
 
@@ -706,32 +594,29 @@ class FormManager:
             content=(
                 f"{C_AQUA}作者: {C_WHITE}{owner}\n"
                 f"{C_AQUA}尺寸: {C_WHITE}{size[0]} x {size[1]} x {size[2]}\n"
-                f"{C_AQUA}方块数: {C_WHITE}{meta.block_count}\n"
+                f"{C_AQUA}区域体积: {C_WHITE}{meta.get_volume()} 方块\n"
                 f"{C_AQUA}维度: {C_WHITE}{meta.dimension}\n"
                 f"{C_AQUA}时间: {C_WHITE}{ts}"
             )
         )
 
         sid = structure_id
-        # 原有按鈕：加载到原坐标
+        # 加载到原坐标
         form.add_button(
             _b("加载到原坐标", C_GREEN),
             icon="textures/ui/icon_recipe_nature",
-            on_click=lambda p, _sid=sid, _m=meta: self._show_mode_select_form(
-                p, f"加载到原坐标: {_m.name}",
-                lambda _p, reliable: self.plugin.load_structure_for_player(
-                    _p, _sid, (_m.min_x, _m.min_y, _m.min_z),
-                    source_type="public", reliable_mode=reliable
-                )
+            on_click=lambda p, _sid=sid, _m=meta: self.plugin.load_structure_for_player(
+                p, _sid, (_m.min_x, _m.min_y, _m.min_z),
+                source_type="public"
             )
         )
-        # 原有按钮：加载建筑（当前位置）
+        # 加载建筑（当前位置）
         form.add_button(
             _b("加载建筑 (当前位置)", C_BLUE),
             icon="textures/ui/icon_recipe_item",
             on_click=lambda p, _sid=sid: self._on_load_current_position_public(p, _sid)
         )
-        # 原有按钮：加载到指定坐标
+        # 加载到指定坐标
         form.add_button(
             _b("加载到指定坐标", C_AQUA),
             icon="textures/ui/icon_setting",
@@ -739,7 +624,7 @@ class FormManager:
                 p, _sid, _m, source_type="public"
             )
         )
-        # 新增按钮：加载建筑（预览模式）
+        # 加载建筑（预览模式）
         form.add_button(
             _b("加载建筑 (预览模式)", C_LIGHT_PURPLE),
             icon="textures/ui/magnifyingGlass",
@@ -778,10 +663,10 @@ class FormManager:
     def _do_unpublish(self, player, structure_id: str, button_idx: int):
         """执行取消公开"""
         if button_idx == 0:
-            ok = self.plugin.db_manager.unpublish_structure(structure_id)
+            ok = self.plugin.unpublish_structure(structure_id)
             if ok:
                 player.send_message(f"{C_GREEN}已取消公开!")
-                self.show_public_structures(player)  # 刺新公开建筑列表
+                self.show_public_structures(player)  # 刷新公开建筑列表
             else:
                 player.send_message(f"{C_RED}操作失败!")
 
@@ -820,7 +705,7 @@ class FormManager:
                     default_value=cfg.plugin_enabled
                 ),
                 TextInput(
-                    f"{_b('最大方块数', C_YELLOW)}",
+                    f"{_b('最大方块数', C_YELLOW)} (单次保存区域体积上限)",
                     placeholder="最大方块数",
                     default_value=str(cfg.max_block_count)
                 ),
@@ -828,15 +713,6 @@ class FormManager:
                     f"{_b('粒子效果ID', C_AQUA)}",
                     placeholder="minecraft:endrod",
                     default_value=cfg.particle_id
-                ),
-                Toggle(
-                    f"{_b('默认保留空气', C_GREEN)}",
-                    default_value=cfg.preserve_air
-                ),
-                TextInput(
-                    f"{_b('排除方块列表', C_RED)} (逗号分隔)",
-                    placeholder="minecraft:grass,minecraft:dirt",
-                    default_value=",".join(cfg.excluded_blocks)
                 ),
                 TextInput(
                     f"{_b('授权玩家保存上限', C_LIGHT_PURPLE)}",
@@ -871,11 +747,6 @@ class FormManager:
                     f"{_b('启用普通玩家权限管理', C_LIGHT_PURPLE)}",
                     default_value=cfg.normal_player_permissions_enabled
                 ),
-                TextInput(
-                    f"{_b('区块等待超时时间（秒）', C_YELLOW)} 快速模式上限×0.5，可靠模式即此值，范围10-300",
-                    placeholder="60",
-                    default_value=str(cfg.chunk_wait_timeout_seconds)
-                ),
             ],
             on_submit=lambda p, data: self._on_config_submit(p, data),
             on_close=lambda p: p.send_message(f"{C_YELLOW}已取消设置")
@@ -889,34 +760,24 @@ class FormManager:
             cfg = self.plugin.config_manager
 
             # data[0]=plugin_enabled, data[1]=max_block, data[2]=particle
-            # data[3]=preserve_air, data[4]=excluded, data[5]=save_limit
-            # data[6]=menu_enabled, data[7]=menu_item, data[8]=foot_block
-            # data[9]=selection_item, data[10]=modify_item, data[11]=normal_perm_enabled
-            # data[12]=chunk_wait_timeout_seconds
+            # data[3]=save_limit, data[4]=menu_enabled, data[5]=menu_item
+            # data[6]=foot_block, data[7]=selection_item, data[8]=modify_item
+            # data[9]=normal_perm_enabled
             plugin_enabled = bool(data[0])
             max_block = int(data[1]) if data[1] else 100000
             particle = str(data[2]).strip() if data[2] else "minecraft:endrod"
-            preserve_air = bool(data[3])
-            excluded_str = str(data[4]).strip()
-            excluded = [b.strip() for b in excluded_str.split(",") if b.strip()] if excluded_str else []
-            save_limit = int(data[5]) if data[5] else 20
-            menu_enabled = bool(data[6])
-            menu_item = str(data[7]).strip() if data[7] else "minecraft:compass"
-            foot_block = str(data[8]).strip() if len(data) > 8 and data[8] else "minecraft:oak_planks"
-            selection_item = str(data[9]).strip() if len(data) > 9 and data[9] else "minecraft:wooden_axe"
-            modify_item = str(data[10]).strip() if len(data) > 10 and data[10] else "minecraft:stick"
-            normal_perm_enabled = bool(data[11]) if len(data) > 11 else False
-            try:
-                chunk_timeout = max(10, min(300, int(data[12]))) if len(data) > 12 and data[12] else 60
-            except (ValueError, TypeError):
-                chunk_timeout = 60
+            save_limit = int(data[3]) if data[3] else 20
+            menu_enabled = bool(data[4])
+            menu_item = str(data[5]).strip() if data[5] else "minecraft:compass"
+            foot_block = str(data[6]).strip() if len(data) > 6 and data[6] else "minecraft:oak_planks"
+            selection_item = str(data[7]).strip() if len(data) > 7 and data[7] else "minecraft:wooden_axe"
+            modify_item = str(data[8]).strip() if len(data) > 8 and data[8] else "minecraft:stick"
+            normal_perm_enabled = bool(data[9]) if len(data) > 9 else False
 
             cfg.update_all({
                 "plugin_enabled": plugin_enabled,
                 "max_block_count": max_block,
                 "particle_id": particle,
-                "preserve_air": preserve_air,
-                "excluded_blocks": excluded,
                 "authorized_save_limit": save_limit,
                 "menu_item_enabled": menu_enabled,
                 "menu_item_id": menu_item,
@@ -924,7 +785,6 @@ class FormManager:
                 "selection_item_id": selection_item,
                 "modify_item_id": modify_item,
                 "normal_player_permissions_enabled": normal_perm_enabled,
-                "chunk_wait_timeout_seconds": chunk_timeout,
             })
 
             player.send_message(f"{C_GREEN}配置已保存并实时生效!")
@@ -1029,6 +889,7 @@ class FormManager:
             icon="textures/ui/arrow_left",
             on_click=lambda p: self.show_permission_form(p)
         )
+
         player.send_form(form)
 
     def _confirm_remove_auth(self, player, name: str):
@@ -1100,6 +961,7 @@ class FormManager:
             icon="textures/ui/arrow_left",
             on_click=lambda p: self.show_permission_form(p)
         )
+
         player.send_form(form)
 
     def _confirm_remove_admin(self, player, name: str):
@@ -1149,22 +1011,22 @@ class FormManager:
 
     def show_admin_player_list(self, player):
         """管理员: 显示所有玩家列表"""
-        players = self.plugin.db_manager.get_all_players()
+        owners = self.plugin.store.all_owners()
 
-        if not players:
+        if not owners:
             player.send_message(f"{C_YELLOW}暂无玩家数据")
             return
 
         form = ActionForm(
             title=_b("玩家数据", C_AQUA),
-            content=f"{C_YELLOW}共 {_b(str(len(players)), C_GREEN)} 个玩家有数据"
+            content=f"{C_YELLOW}共 {_b(str(len(owners)), C_GREEN)} 个玩家有数据"
         )
 
-        for dir_name, display_name in players:
+        for owner_uuid, owner_name in owners:
             form.add_button(
-                f"{_b(display_name, C_GREEN)}\n{C_WHITE}{dir_name}",
+                f"{_b(owner_name, C_GREEN)}\n{C_WHITE}{owner_uuid}",
                 icon="textures/ui/icon_steve",
-                on_click=lambda p, _dn=dir_name, _dp=display_name: self.show_admin_player_structures(p, _dn, _dp)
+                on_click=lambda p, _ou=owner_uuid, _on=owner_name: self.show_admin_player_structures(p, _ou, _on)
             )
 
         form.add_button(
@@ -1175,9 +1037,9 @@ class FormManager:
 
         player.send_form(form)
 
-    def show_admin_player_structures(self, player, dir_name: str, display_name: str):
+    def show_admin_player_structures(self, player, owner_uuid: str, display_name: str):
         """管理员: 显示指定玩家的建筑列表"""
-        structures = self.plugin.db_manager.get_all_structures_for_player_dir(dir_name)
+        structures = self.plugin.store.list_structures_of_owner(owner_uuid)
 
         if not structures:
             player.send_message(f"{C_YELLOW}该玩家没有保存的建筑")
@@ -1199,7 +1061,7 @@ class FormManager:
             form.add_button(
                 btn_text,
                 icon="textures/blocks/structure_block",
-                on_click=lambda p, _sid=sid, _dn=dir_name, _dp=display_name: self.show_admin_structure_detail(p, _sid, _dn, _dp)
+                on_click=lambda p, _sid=sid, _ou=owner_uuid, _on=display_name: self.show_admin_structure_detail(p, _sid, _ou, _on)
             )
 
         form.add_button(
@@ -1211,9 +1073,9 @@ class FormManager:
         player.send_form(form)
 
     def show_admin_structure_detail(self, player, structure_id: str,
-                                     dir_name: str, display_name: str):
+                                     owner_uuid: str, display_name: str):
         """管理员: 显示建筑详情"""
-        meta = self.plugin.db_manager.get_metadata_from_dir(dir_name, structure_id)
+        meta = self.plugin.store.get_structure(structure_id)
         if meta is None:
             player.send_message(f"{C_RED}建筑不存在!")
             return
@@ -1227,7 +1089,8 @@ class FormManager:
                 f"{C_AQUA}所有者: {C_WHITE}{display_name}\n"
                 f"{C_AQUA}建筑ID: {C_WHITE}{meta.structure_id}\n"
                 f"{C_AQUA}尺寸: {C_WHITE}{size[0]} x {size[1]} x {size[2]}\n"
-                f"{C_AQUA}方块数: {C_WHITE}{meta.block_count}\n"
+                f"{C_AQUA}区域体积: {C_WHITE}{meta.get_volume()} 方块"
+                + (f"\n{C_LIGHT_PURPLE}(大区域结构束)" if meta.is_bundle else "") + "\n"
                 f"{C_AQUA}坐标: {C_WHITE}({meta.min_x},{meta.min_y},{meta.min_z}) ~ ({meta.max_x},{meta.max_y},{meta.max_z})\n"
                 f"{C_AQUA}维度: {C_WHITE}{meta.dimension}\n"
                 f"{C_AQUA}时间: {C_WHITE}{ts}"
@@ -1235,124 +1098,120 @@ class FormManager:
         )
 
         sid = structure_id
-        dn = dir_name
-        dp = display_name
+        ou = owner_uuid
+        dn = display_name
 
         form.add_button(
             _b("加载到原坐标", C_GREEN),
             icon="textures/ui/icon_recipe_nature",
-            on_click=lambda p, _sid=sid, _m=meta, _dn=dn: self._show_mode_select_form(
-                p, f"加载到原坐标: {_m.name}",
-                lambda _p, reliable: self.plugin.load_structure_for_player(
-                    _p, _sid, (_m.min_x, _m.min_y, _m.min_z),
-                    source_type="admin", source_dir=_dn, reliable_mode=reliable
-                )
+            on_click=lambda p, _sid=sid, _m=meta: self.plugin.load_structure_for_player(
+                p, _sid, (_m.min_x, _m.min_y, _m.min_z),
+                source_type="admin"
             )
         )
         form.add_button(
             _b("加载建筑 (当前位置)", C_BLUE),
             icon="textures/ui/icon_recipe_item",
-            on_click=lambda p, _sid=sid, _dn=dn: self._on_load_current_position_admin(p, _sid, _dn)
+            on_click=lambda p, _sid=sid: self._on_load_current_position_admin(p, _sid)
         )
         form.add_button(
             _b("加载到指定坐标", C_AQUA),
             icon="textures/ui/icon_setting",
-            on_click=lambda p, _sid=sid, _m=meta, _dn=dn: self.show_load_position_form(
-                p, _sid, _m, source_type="admin", source_dir=_dn
+            on_click=lambda p, _sid=sid, _m=meta: self.show_load_position_form(
+                p, _sid, _m, source_type="admin"
             )
         )
         form.add_button(
             _b("加载建筑 (预览模式)", C_LIGHT_PURPLE),
             icon="textures/ui/magnifyingGlass",
-            on_click=lambda p, _sid=sid, _m=meta, _dn=dn: self.show_load_config_form(
-                p, _sid, _m, source_type="admin", source_dir=_dn
+            on_click=lambda p, _sid=sid, _m=meta: self.show_load_config_form(
+                p, _sid, _m, source_type="admin"
             )
         )
         form.add_button(
             _b("导入到我的建筑", C_LIGHT_PURPLE),
             icon="textures/ui/import",
-            on_click=lambda p, _sid=sid, _dn=dn: self._confirm_import(p, _sid, _dn)
+            on_click=lambda p, _sid=sid, _ou=ou, _dn=dn: self._confirm_import(p, _sid, _ou, _dn)
         )
         form.add_button(
             _b("公开此建筑", C_YELLOW),
             icon="textures/ui/world_glyph_color",
-            on_click=lambda p, _sid=sid, _dn=dn: self._confirm_admin_publish(p, _sid, _dn)
+            on_click=lambda p, _sid=sid, _ou=ou, _dn=dn: self._confirm_admin_publish(p, _sid, _ou, _dn)
         )
         form.add_button(
             _b("删除此建筑", C_RED),
             icon="textures/ui/trash",
-            on_click=lambda p, _sid=sid, _dn=dn, _dp=dp: self._confirm_admin_delete(p, _sid, _dn, _dp)
+            on_click=lambda p, _sid=sid, _ou=ou, _dn=dn: self._confirm_admin_delete(p, _sid, _ou, _dn)
         )
         form.add_button(
             _b("返回列表", C_YELLOW),
             icon="textures/ui/arrow_left",
-            on_click=lambda p, _dn=dn, _dp=dp: self.show_admin_player_structures(p, _dn, _dp)
+            on_click=lambda p, _ou=ou, _dn=dn: self.show_admin_player_structures(p, _ou, _dn)
         )
 
         player.send_form(form)
 
-    def _confirm_import(self, player, structure_id: str, source_dir: str):
+    def _confirm_import(self, player, structure_id: str, owner_uuid: str, display_name: str):
         """确认导入"""
         form = MessageForm(
             title=_b("确认导入", C_LIGHT_PURPLE),
             content=f"{C_YELLOW}确定要将此建筑导入到你的建筑库吗?",
             button1=_b("确认", C_GREEN),
             button2=_b("取消", C_RED),
-            on_submit=lambda p, idx: self._do_import(p, structure_id, source_dir, idx)
+            on_submit=lambda p, idx: self._do_import(p, structure_id, owner_uuid, display_name, idx)
         )
         player.send_form(form)
 
-    def _do_import(self, player, structure_id: str, source_dir: str, idx: int):
-        """执行导入"""
+    def _do_import(self, player, structure_id: str, owner_uuid: str,
+                   display_name: str, idx: int):
+        """执行导入（结构文件不动，仅转移元数据归属）"""
         if idx == 0:
-            new_id = self.plugin.db_manager.import_structure_to_player(
-                source_dir, structure_id, str(player.unique_id), player.name
-            )
-            ok = new_id is not None
+            ok = self.plugin.import_structure_to_me(player, structure_id)
             if ok:
                 player.send_message(f"{C_GREEN}建筑已导入到你的建筑库!")
-                self.show_my_structures(player)  # 刺新我的建筑列表
+                self.show_my_structures(player)  # 刷新我的建筑列表
             else:
                 player.send_message(f"{C_RED}导入失败!")
 
-    def _confirm_admin_publish(self, player, structure_id: str, source_dir: str):
+    def _confirm_admin_publish(self, player, structure_id: str, owner_uuid: str, display_name: str):
         """管理员确认公开"""
         form = MessageForm(
             title=_b("确认公开", C_YELLOW),
             content=f"{C_YELLOW}确定要公开此建筑吗?",
             button1=_b("确认", C_GREEN),
             button2=_b("取消", C_RED),
-            on_submit=lambda p, idx: self._do_admin_publish(p, structure_id, source_dir, idx)
+            on_submit=lambda p, idx: self._do_admin_publish(p, structure_id, owner_uuid, display_name, idx)
         )
         player.send_form(form)
 
-    def _do_admin_publish(self, player, structure_id: str, source_dir: str, idx: int):
+    def _do_admin_publish(self, player, structure_id: str, owner_uuid: str,
+                          display_name: str, idx: int):
         """管理员执行公开"""
         if idx == 0:
-            ok = self.plugin.db_manager.admin_publish_structure(structure_id, source_dir)
+            ok = self.plugin.admin_publish_structure(player, structure_id)
             if ok:
                 player.send_message(f"{C_GREEN}建筑已公开!")
-                self.show_public_structures(player)  # 刺新公开建筑列表
+                self.show_public_structures(player)  # 刷新公开建筑列表
             else:
                 player.send_message(f"{C_RED}公开失败!")
 
-    def _confirm_admin_delete(self, player, structure_id: str, dir_name: str, display_name: str):
+    def _confirm_admin_delete(self, player, structure_id: str, owner_uuid: str, display_name: str):
         """管理员确认删除"""
         form = MessageForm(
             title=_b("确认删除", C_RED),
             content=f"{C_RED}{C_BOLD}警告!{C_RESET}\n\n{C_YELLOW}删除后无法恢复,确定要删除此建筑吗?",
             button1=_b("确认删除", C_RED),
             button2=_b("取消", C_GREEN),
-            on_submit=lambda p, idx: self._do_admin_delete(p, structure_id, dir_name, display_name, idx)
+            on_submit=lambda p, idx: self._do_admin_delete(p, structure_id, owner_uuid, display_name, idx)
         )
         player.send_form(form)
 
-    def _do_admin_delete(self, player, structure_id: str, dir_name: str, display_name: str, idx: int):
+    def _do_admin_delete(self, player, structure_id: str, owner_uuid: str,
+                         display_name: str, idx: int):
         """管理员执行删除"""
         if idx == 0:
-            self.plugin.db_manager.delete_structure_from_dir(dir_name, structure_id)
-            player.send_message(f"{C_GREEN}建筑已删除!")
-            self.show_admin_player_structures(player, dir_name, display_name)
+            self.plugin.admin_delete_structure(player, structure_id)
+            self.show_admin_player_structures(player, owner_uuid, display_name)
 
     # ================================================================
     #  普通玩家权限管理
@@ -1567,16 +1426,13 @@ class FormManager:
                     player.send_message(f"{C_RED}玩家名称不能为空!")
                     return
 
-                # 尝试从数据库查找玩家 UUID
-                # 这里需要遍历所有玩家文件夹来查找
-                players = self.plugin.db_manager.get_all_players()
+                # 从元数据存储中查找玩家 UUID
+                owners = self.plugin.store.all_owners()
                 target_uuid = None
-                for dir_name, display_name in players:
-                    if display_name.lower() == target_name.lower():
-                        # 从文件夹名提取 UUID (格式: UUID_昵称)
-                        uuid_str = dir_name.split("_")[0]
-                        from uuid import UUID
-                        target_uuid = UUID(uuid_str)
+                for owner_uuid, owner_name in owners:
+                    if owner_name.lower() == target_name.lower():
+                        target_uuid = owner_uuid
+                        target_name = owner_name
                         break
 
                 if target_uuid:
@@ -1596,7 +1452,7 @@ class FormManager:
             target_uuid = UUID(target_uuid)
 
         normal_perm_mgr = self.plugin.normal_perm_manager
-        
+
         # 获取玩家当前权限（如果有单独设置则使用，否则使用默认）
         current_perms = normal_perm_mgr.get_effective_permissions(target_uuid)
 
@@ -1722,8 +1578,8 @@ class FormManager:
     #  加载建筑配置表单（包含预览功能）
     # ================================================================
     def show_load_config_form(self, player, structure_id: str, meta,
-                              source_type: str = "player", source_dir: str = ""):
+                              source_type: str = "player"):
         """显示加载建筑配置表单（包含预览选项）"""
         load_forms.show_load_config_form(
-            self, player, structure_id, meta, source_type, source_dir
+            self, player, structure_id, meta, source_type
         )
