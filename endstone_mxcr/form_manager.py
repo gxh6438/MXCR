@@ -352,7 +352,7 @@ class FormManager:
         """显示建筑详情"""
         p_uuid = str(player.unique_id)
         p_name = player.name
-        meta = self.plugin.store.get_owned_structure(p_uuid, structure_id, p_name)
+        meta = self.plugin.store.get_owned_structure(p_uuid, p_name, structure_id)
 
         if meta is None:
             player.send_message(f"{C_RED}建筑不存在!")

@@ -5,4 +5,4 @@ MXCR - Minecraft X Copy Region
 from .mxcr_plugin import MXCRPlugin
 
 __all__ = ["MXCRPlugin"]
-__version__ = "1.1.0"
+__version__ = "1.1.1"
