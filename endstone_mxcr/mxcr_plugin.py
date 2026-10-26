@@ -472,6 +472,11 @@ class MXCRPlugin(Plugin):
         pos = (block.x, block.y, block.z)
         dim_name = block.dimension.name
 
+        # PC 端按住右键会连发 use 事件（约 0.2s 一次），
+        # 不防抖会瞬间覆盖 pos1 或误设 pos2，表现为"只能选择一个点"
+        if self._selection_mgr.is_debounced(player_name, pos):
+            return
+
         selection = self._selection_mgr.get_selection(player_name)
 
         # 如果持有修改物品(木棍)且已经有两个点,则修改第二个点

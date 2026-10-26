@@ -1,17 +1,24 @@
 """
 选区管理模块 - 包含粒子任务管理
 """
+import time
+
 from .structure_data import Selection
 
 
 class SelectionManager:
     """选区管理器 - 使用玩家名称作为键"""
 
+    # 交互防抖窗口（秒）：PC 端按住右键约每 0.2 秒重复触发一次 use 事件，
+    # 不加防抖会瞬间把 pos1 覆盖回 pos1（同方块）或误设 pos2（相邻方块）。
+    INTERACT_DEBOUNCE = 0.35
+
     def __init__(self):
         """初始化选区管理器"""
         self._selections = {}            # player_name -> Selection
         self._selecting_players = set()   # 正在选区的玩家名称集合
         self._particle_tasks = {}         # player_name -> Task (粒子定时任务)
+        self._last_interact = {}          # player_name -> (monotonic 时间戳, pos)
 
     def start_selection(self, player_name: str):
         """开始选区"""
@@ -56,8 +63,22 @@ class SelectionManager:
         """清除玩家的选区"""
         self._selections.pop(player_name, None)
         self._selecting_players.discard(player_name)
+        self._last_interact.pop(player_name, None)
         # 取消粒子任务
         self.cancel_particle_task(player_name)
+
+    def is_debounced(self, player_name: str, pos: tuple) -> bool:
+        """
+        交互防抖：防抖窗口内的重复点击视为客户端连发，返回 True 表示应忽略。
+
+        每次调用都会记录本次时间戳（无论是否命中防抖）。
+        """
+        now = time.monotonic()
+        last = self._last_interact.get(player_name)
+        self._last_interact[player_name] = (now, pos)
+        if last is None:
+            return False
+        return (now - last[0]) < self.INTERACT_DEBOUNCE
 
     def has_complete_selection(self, player_name: str) -> bool:
         """检查玩家是否有完整的选区"""
